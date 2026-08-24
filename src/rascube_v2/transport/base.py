@@ -1,0 +1,19 @@
+from __future__ import annotations
+
+from typing import Protocol, runtime_checkable
+
+
+@runtime_checkable
+class AsyncByteTransport(Protocol):
+    @property
+    def is_open(self) -> bool: ...
+
+    async def open(self) -> None: ...
+
+    async def close(self) -> None: ...
+
+    async def read(self, max_bytes: int = 4096) -> bytes: ...
+
+    async def write(self, data: bytes) -> None: ...
+
+    async def set_dtr(self, enabled: bool) -> None: ...

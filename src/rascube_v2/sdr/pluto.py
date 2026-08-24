@@ -1,0 +1,152 @@
+from __future__ import annotations
+
+import dataclasses
+import math
+import socket
+import threading
+import time
+from collections.abc import Callable, Iterator
+from typing import Any
+
+from rascube_v2.constants import BANDWIDTH_KHZ
+from rascube_v2.decoder import decode_main_telemetry_hex, decode_telemetry_to_dict
+from rascube_v2.models.telemetry import MainTelemetrySample
+
+
+@dataclasses.dataclass
+class SDRLoRaConfig:
+    serial_number: int
+    sample_rate: int = 1_000_000
+    rx_gain_db: float = 50.0
+    spreading_factor: int = 7
+    bandwidth_hz: int = 125_000
+    coding_rate: str = "4/5"
+    sdr_uri: str = "ip:192.168.2.1"  # Or "usb:..."
+
+    @property
+    def frequency_hz(self) -> int:
+        """Calculate exact LoRa downlink frequency for satellite serial number."""
+        channel = self.serial_number % 18
+        return 916_000_000 + channel * 600_000
+
+
+class PlutoSDRReceiver:
+    """Receiver adapter for ADALM-PLUTO and Pluto+ SDR devices.
+
+    Supports:
+    1. Direct Pluto+ connection via `pyadi-iio` / `adi.Pluto`.
+    2. GNU Radio / external SDR demodulator UDP bridge stream.
+    """
+
+    def __init__(
+        self,
+        config: SDRLoRaConfig,
+        on_sample: Callable[[MainTelemetrySample], None] | None = None,
+    ) -> None:
+        self.config = config
+        self.on_sample = on_sample
+        self._running = False
+        self._thread: threading.Thread | None = None
+        self._sdr_device: Any = None
+        self.total_packets_received = 0
+        self.last_rssi_dbm: float | None = None
+
+    @classmethod
+    def calculate_frequency_hz(cls, serial_number: int) -> int:
+        channel = serial_number % 18
+        return 916_000_000 + channel * 600_000
+
+    def start_direct_sdr(self) -> None:
+        """Initialize Pluto+ SDR device directly via pyadi-iio with auto-discovery fallback."""
+        try:
+            import adi  # type: ignore[import-untyped]
+        except ImportError as exc:
+            raise RuntimeError(
+                "pyadi-iio library is required for direct Pluto+ connection. "
+                "Install with: pip install pyadi-iio"
+            ) from exc
+
+        uris_to_try = [self.config.sdr_uri]
+        for candidate in ["usb:", "ip:pluto.local", "ip:192.168.2.1"]:
+            if candidate not in uris_to_try:
+                uris_to_try.append(candidate)
+
+        connected_device = None
+        last_error = None
+
+        for uri in uris_to_try:
+            try:
+                print(f"[Pluto+ SDR] Trying to connect via '{uri}'...")
+                connected_device = adi.Pluto(uri)
+                self.config.sdr_uri = uri
+                break
+            except Exception as exc:
+                last_error = exc
+
+        if connected_device is None:
+            raise RuntimeError(
+                f"Could not connect to Pluto+ SDR on any URI ({', '.join(uris_to_try)}).\n"
+                f"Details: {last_error}\n"
+                f"Checklist:\n"
+                f"1. Is the USB cable connected to the 'MIDDLE' USB port on Pluto (marked Data/USB)?\n"
+                f"2. If using IP 192.168.2.1, ensure your Mac Ethernet adapter is set to Static IP 192.168.2.10 (Subnet: 255.255.255.0)."
+            )
+
+        self._sdr_device = connected_device
+        self._sdr_device.sample_rate = int(self.config.sample_rate)
+        self._sdr_device.rx_lo = int(self.config.frequency_hz)
+        self._sdr_device.rx_rf_bandwidth = int(self.config.bandwidth_hz * 2)
+        self._sdr_device.gain_control_mode_chan0 = "manual"
+        self._sdr_device.rx_hardwaregain_chan0 = float(self.config.rx_gain_db)
+        self._sdr_device.rx_buffer_size = 16384
+
+        print(
+            f"[Pluto+ SDR] Connected successfully ({self.config.sdr_uri})!\n"
+            f"[Pluto+ SDR] Tuned to {self.config.frequency_hz / 1e6:.3f} MHz "
+            f"(Channel {self.config.serial_number % 18}), Gain: {self.config.rx_gain_db} dB"
+        )
+
+    def start_udp_listener(self, host: str = "127.0.0.1", port: int = 9090) -> None:
+        """Listen for demodulated telemetry frames from GNU Radio / gr-lorasdr via UDP."""
+        self._running = True
+        self._thread = threading.Thread(
+            target=self._udp_listen_worker, args=(host, port), daemon=True
+        )
+        self._thread.start()
+        print(f"[SDR UDP Bridge] Listening for demodulated packets on {host}:{port}...")
+
+    def _udp_listen_worker(self, host: str, port: int) -> None:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.bind((host, port))
+        sock.settimeout(1.0)
+
+        while self._running:
+            try:
+                data, addr = sock.recvfrom(2048)
+                if not data:
+                    continue
+
+                # Process received packet
+                try:
+                    sample = decode_main_telemetry_hex(data)
+                    self.total_packets_received += 1
+                    if self.on_sample:
+                        self.on_sample(sample)
+                except Exception as err:
+                    print(f"[SDR Decoder] Failed to decode packet ({len(data)} bytes): {err}")
+            except socket.timeout:
+                continue
+            except Exception as exc:
+                if self._running:
+                    print(f"[SDR UDP Bridge] Error: {exc}")
+                break
+
+        sock.close()
+
+    def stop(self) -> None:
+        self._running = False
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=1.0)
+        self._sdr_device = None
+        print("[Pluto+ SDR] Receiver stopped.")

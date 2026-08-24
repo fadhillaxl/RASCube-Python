@@ -1,0 +1,63 @@
+[build-system]
+requires = ["hatchling>=1.24"]
+build-backend = "hatchling.build"
+
+[project]
+name = "rascube-v2"
+version = "0.1.0"
+description = "Typed Python client for the RASCubeV2 USB receiver and satellite"
+readme = "README.md"
+requires-python = ">=3.11"
+authors = [
+    { name = "G. Robinson Aerospace" },
+]
+dependencies = [
+    "pyserial>=3.5",
+    "questionary>=2.1.0",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Typing :: Typed",
+]
+
+[dependency-groups]
+dev = [
+    "hypothesis>=6.100",
+    "matplotlib>=3.9",
+    "mypy>=1.10",
+    "pytest>=8.2",
+    "pytest-asyncio>=0.23",
+    "pytest-cov>=5.0",
+    "ruff>=0.5",
+]
+[tool.hatch.build.targets.wheel]
+packages = ["src/rascube_v2"]
+
+[tool.pytest.ini_options]
+addopts = "--strict-markers --strict-config"
+asyncio_mode = "auto"
+testpaths = ["tests"]
+markers = [
+    "hardware: requires a connected RASCubeV2 receiver",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+packages = ["rascube_v2"]
+mypy_path = "src"
+warn_unused_ignores = true
+
+[[tool.mypy.overrides]]
+module = "serial.*"
+ignore_missing_imports = true
