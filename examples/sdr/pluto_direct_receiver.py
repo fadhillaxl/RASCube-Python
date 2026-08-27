@@ -189,11 +189,25 @@ def main() -> None:
                         decoded = decode_lora_frame(frame_symbols, sf=sf, cr=1)
                         if decoded and len(decoded) >= 20:
                             total_decoded += 1
-                            raw_pkt = decoded
+                            # Estimate RF power (RSSI) and SNR
+                            p_sig = float(np.mean(np.abs(iq_proc[payload_start : payload_start + 1024]) ** 2) + 1e-12)
+                            meas_rssi = float(-100.0 + 10.0 * np.log10(p_sig * 1000.0))
+                            meas_snr = float(np.mean(snrs))
+
+                            # Format to full RASCube Ground Station 123-byte Frame (0x10 0x79 + 113 payload + 8 RSSI/SNR)
+                            payload_113 = decoded[:113].ljust(113, b"\x00")
+                            rssi_bytes = struct.pack("<f", meas_rssi)
+                            snr_bytes = struct.pack("<f", meas_snr)
+                            rascube_pkt = bytes([0x10, 0x79]) + payload_113 + rssi_bytes + snr_bytes
+
                             if args.hex:
-                                print(raw_pkt.hex().upper(), flush=True)
+                                print(rascube_pkt.hex().upper(), flush=True)
                             else:
-                                print(f"[RX #{total_decoded}] Frame len={len(raw_pkt)} bytes: {raw_pkt[:16].hex().upper()}...", flush=True)
+                                try:
+                                    sample = decode_main_telemetry_hex(rascube_pkt)
+                                    print(f"[{total_decoded}] Uptime: {sample.device_uptime_ms}ms | Bat: {sample.voltage_cell_1_mv}mV | RSSI: {sample.radio.rssi_dbm:.1f}dBm | SNR: {sample.radio.snr_db:.1f}dB", flush=True)
+                                except Exception:
+                                    print(f"[{total_decoded}] {rascube_pkt.hex().upper()}", flush=True)
 
                         # Skip forward past this packet
                         idx += 200

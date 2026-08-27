@@ -203,9 +203,14 @@ class PlutoSDRReceiver:
                 if not data:
                     continue
 
-                # Format to full 123-byte packet (0x10 0x79 + 121 bytes payload)
+                # Format to full RASCube 123-byte packet (0x10 0x79 + 113 payload + 8 RSSI/SNR)
+                import struct
                 if len(data) == 121:
                     raw_packet = bytes([0x10, 0x79]) + data
+                elif len(data) == 113:
+                    rssi_bytes = struct.pack("<f", float(self.last_rssi_dbm or -60.0))
+                    snr_bytes = struct.pack("<f", float(self.last_snr_db or 12.0))
+                    raw_packet = bytes([0x10, 0x79]) + data + rssi_bytes + snr_bytes
                 else:
                     raw_packet = data
 
