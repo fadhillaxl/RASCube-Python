@@ -338,7 +338,7 @@ class PlutoSDRTransmitter:
 
         raise RuntimeError(f"Could not connect PlutoSDR TX on any URI: {last_error}")
 
-    def transmit_bytes(self, payload: bytes, *, add_address_header: bool = True) -> None:
+    def transmit_bytes(self, payload: bytes, *, add_address_header: bool = True, repeat: int = 1) -> None:
         """Modulates payload bytes into LoRa CSS and transmits via PlutoSDR TX antenna.
 
         Per Section 8.2 of RASCube V2 specification:
@@ -362,8 +362,11 @@ class PlutoSDRTransmitter:
             bw=self.config.bandwidth_hz,
             samp_rate=self.config.sample_rate,
         )
-        if hasattr(self._sdr_device, "tx_destroy_buffer"):
-            self._sdr_device.tx_destroy_buffer()
-        self._sdr_device.tx_cyclic_buffer = False
-        self._sdr_device.tx(iq_tx)
+        for rep in range(max(1, repeat)):
+            if hasattr(self._sdr_device, "tx_destroy_buffer"):
+                self._sdr_device.tx_destroy_buffer()
+            self._sdr_device.tx_cyclic_buffer = False
+            self._sdr_device.tx(iq_tx)
+            if rep < repeat - 1:
+                time.sleep(0.05)
 

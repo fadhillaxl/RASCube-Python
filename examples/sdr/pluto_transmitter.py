@@ -40,7 +40,8 @@ def main() -> None:
     parser.add_argument("--uri", default="usb:", help="PlutoSDR URI (default: usb:, or ip:192.168.2.1)")
     parser.add_argument("--tx-gain", type=float, default=0.0, help="SDR TX hardware attenuation in dB (0.0=max power ~+10dBm, -20.0=low power)")
     parser.add_argument("--sf", type=int, default=7, help="LoRa Spreading Factor (default: 7)")
-    parser.add_argument("--bw", type=int, default=500_000, help="LoRa Bandwidth in Hz (default: 500000)")
+    parser.add_argument("--bw", type=int, default=125_000, help="LoRa Bandwidth in Hz (default: 125000, or 500000)")
+    parser.add_argument("--repeat", type=int, default=3, help="Number of times to burst-repeat each frame (default: 3)")
 
     # Command options
     cmd_group = parser.add_mutually_exclusive_group(required=True)
@@ -79,14 +80,14 @@ def main() -> None:
     if args.ping:
         payload = bytes([HostPort.OBC_INFO, 0x01, 0x00])
         print(f"\n[Uplink TX] Sending OBC_INFO wake-up request (0x{payload.hex().upper()})...", flush=True)
-        transmitter.transmit_bytes(payload)
+        transmitter.transmit_bytes(payload, repeat=args.repeat)
         print("✅ Transmission complete.")
 
     elif args.rgb:
         r, g, b = [max(0, min(255, val)) for val in args.rgb]
         payload = bytes([HostPort.ARDUINO_RGB, 0x03, r, g, b])
         print(f"\n[Uplink TX] Setting RGB LED ({r}, {g}, {b}) -> 0x{payload.hex().upper()}...", flush=True)
-        transmitter.transmit_bytes(payload)
+        transmitter.transmit_bytes(payload, repeat=args.repeat)
         print("✅ Transmission complete.")
 
     elif args.blink:
@@ -100,12 +101,12 @@ def main() -> None:
             (255, 255, 255, "WHITE"),
             (0, 0, 0, "OFF"),
         ]
-        print("\n[Blink Mode] Transmitting RGB color cycle over the air (Ctrl+C to stop)...\n")
+        print(f"\n[Blink Mode] Transmitting RGB color cycle (BW={args.bw/1000:.0f}kHz, Repeat={args.repeat}x, Ctrl+C to stop)...\n")
         try:
             while True:
                 for r, g, b, name in colors:
                     payload = bytes([HostPort.ARDUINO_RGB, 0x03, r, g, b])
-                    transmitter.transmit_bytes(payload)
+                    transmitter.transmit_bytes(payload, repeat=args.repeat)
                     t_str = time.strftime("%H:%M:%S")
                     print(f"[{t_str}] 💡 LED -> {name} (RGB: {r},{g},{b})", flush=True)
                     time.sleep(0.8)
@@ -115,13 +116,13 @@ def main() -> None:
     elif args.song:
         payload = bytes([HostPort.ARDUINO_STARTUP_SONG, 0x01, 0x00])
         print(f"\n[Uplink TX] Triggering startup song -> 0x{payload.hex().upper()}...", flush=True)
-        transmitter.transmit_bytes(payload)
+        transmitter.transmit_bytes(payload, repeat=args.repeat)
         print("✅ Transmission complete.")
 
     elif args.raw_hex:
         payload = bytes.fromhex(args.raw_hex.replace(" ", "").replace("0x", ""))
         print(f"\n[Uplink TX] Transmitting custom frame -> 0x{payload.hex().upper()}...", flush=True)
-        transmitter.transmit_bytes(payload)
+        transmitter.transmit_bytes(payload, repeat=args.repeat)
         print("✅ Transmission complete.")
 
     elif args.beacon is not None:
@@ -132,7 +133,7 @@ def main() -> None:
         try:
             while True:
                 count += 1
-                transmitter.transmit_bytes(payload)
+                transmitter.transmit_bytes(payload, repeat=args.repeat)
                 t_str = time.strftime("%H:%M:%S")
                 print(f"[{t_str}] 📡 Beacon #{count} transmitted to Sat #{args.sat}", flush=True)
                 time.sleep(interval)
@@ -142,3 +143,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
