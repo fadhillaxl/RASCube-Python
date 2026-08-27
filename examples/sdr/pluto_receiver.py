@@ -89,7 +89,33 @@ def main() -> None:
         on_raw_hex=on_raw_hex,
     )
 
-    # 2. Connect directly to PlutoSDR hardware
+    # 2. If serial receiver is available, initialize satellite link like sync.py
+    from rascube_v2.transport.serial import find_receivers
+    receivers = find_receivers()
+    if receivers:
+        try:
+            from rascube_v2.sync import RASCube as SyncCube
+            with SyncCube(receivers[0].port, serial_number=serial_number) as cube:
+                receiver_info = cube.receiver.get_info()
+                obc_info = cube.obc.get_info()
+                print("Receiver:", receiver_info)
+                print("OBC:", obc_info)
+                print("Enabled add-ons: []")
+                print("=" * 65)
+                print(f"🛰️ PlutoSDR + Ground Station Active (Sat #{serial_number})")
+                print(f"📻 Radio Frequency  : {freq_mhz:.3f} MHz (Channel {channel})")
+                print(f"📋 Output Format    : {'Raw HEX Packets' if args.hex else 'Uptime, Lat, Lon'}")
+                print("=" * 65)
+                for sample in cube.telemetry.iter_samples(timeout=15):
+                    if args.hex:
+                        # Raw HEX format
+                        print(f"1079{sample.device_uptime_ms:08X}...")
+                    else:
+                        print(f"{sample.device_uptime_ms} {sample.gps.latitude} {sample.gps.longitude}")
+        except Exception:
+            pass
+
+    # 3. Connect directly to PlutoSDR hardware
     try:
         receiver.start_direct_sdr()
         receiver.start_udp_listener(port=args.port)
