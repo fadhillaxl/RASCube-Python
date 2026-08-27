@@ -129,14 +129,26 @@ class PlutoSDRReceiver:
         self._thread.start()
 
     def _sdr_rx_worker(self) -> None:
-        """Continuous background thread reading Pluto+ SDR raw I/Q samples."""
+        """Continuous background thread reading Pluto+ SDR raw I/Q samples and feeding DSP/UDP."""
+        udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         while self._running and self._sdr_device is not None:
             try:
                 iq_data = self._sdr_device.rx()
                 if iq_data is None or len(iq_data) == 0:
-                    time.sleep(0.01)
+                    time.sleep(0.005)
                     continue
 
+                # Forward raw complex64 I/Q to local DSP receiver
+                try:
+                    raw_c64 = iq_data.astype(np.complex64).tobytes()
+                    # Chunk into standard UDP packet size (1472 bytes = 184 complex64)
+                    chunk_size = 1472
+                    for i in range(0, len(raw_c64), chunk_size):
+                        udp_sock.sendto(raw_c64[i : i + chunk_size], ("127.0.0.1", 9090))
+                except Exception:
+                    pass
+
+                # Also run software DSP
                 if self._dsp is not None:
                     packets = self._dsp.demodulate_samples(iq_data)
                     for pkt in packets:
