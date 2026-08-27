@@ -317,14 +317,13 @@ Invalid arguments can also raise `ValueError`. Event-stream deadlines raise buil
 
 ## Examples
 
-- [`examples/basic/sync.py`](examples/basic/sync.py)
-- [`examples/basic/async.py`](examples/basic/async.py)
-- [`examples/plotting/sync.py`](examples/plotting/sync.py)
-- [`examples/plotting/async.py`](examples/plotting/async.py)
-- [`examples/reaction_wheel/sync.py`](examples/reaction_wheel/sync.py)
-- [`examples/reaction_wheel/async.py`](examples/reaction_wheel/async.py)
-- [`examples/camera/sync.py`](examples/camera/sync.py)
-- [`examples/camera/async.py`](examples/camera/async.py)
+- **REST API Server & Swagger Docs**: [`examples/api/server.py`](examples/api/server.py) (See [API Tutorial](examples/api/README.md))
+- **Raw Telemetry HEX Ingest & Decoder**: [`examples/basic/raw_hex.py`](examples/basic/raw_hex.py) & [`examples/basic/decode_hex.py`](examples/basic/decode_hex.py)
+- **Pluto+ SDR Satellite Receiver**: [`examples/sdr/pluto_receiver.py`](examples/sdr/pluto_receiver.py)
+- **Basic CLI Clients**: [`examples/basic/sync.py`](examples/basic/sync.py) & [`examples/basic/async.py`](examples/basic/async.py)
+- **Realtime Plotting**: [`examples/plotting/sync.py`](examples/plotting/sync.py) & [`examples/plotting/async.py`](examples/plotting/async.py)
+- **Reaction Wheel**: [`examples/reaction_wheel/sync.py`](examples/reaction_wheel/sync.py) & [`examples/reaction_wheel/async.py`](examples/reaction_wheel/async.py)
+- **Camera Capture**: [`examples/camera/sync.py`](examples/camera/sync.py) & [`examples/camera/async.py`](examples/camera/async.py)
 
 The plotting examples show a rolling 30-second accelerometer history. They require
 Matplotlib, which is included in the development dependency group installed by `uv sync`.
