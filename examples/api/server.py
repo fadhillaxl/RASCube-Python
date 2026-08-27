@@ -70,6 +70,8 @@ class GroundStationState:
         }
         self.latest_image: bytes | None = None
         self.latest_image_metadata: dict[str, Any] | None = None
+        self.partial_image: bytes | None = None
+        self.camera_blocks: dict[int, bytes] = {}
         self.camera_chunks: list[dict[str, Any]] = []
         self.camera_assembler = CameraAssembler()
         self.camera_lock = threading.Lock()
@@ -203,6 +205,8 @@ def trigger_camera_capture(timeout: float = 30.0) -> None:
         state.camera_status = "capturing"
         state.camera_assembler.reset()
         state.camera_chunks.clear()
+        state.camera_blocks.clear()
+        state.partial_image = None
         state.camera_progress = {
             "blocks_received": 0,
             "total_bytes": 0,
@@ -221,6 +225,7 @@ def trigger_camera_capture(timeout: float = 30.0) -> None:
                     now = time.time()
                     elapsed = round(now - start_time, 2)
                     with state.lock:
+                        state.camera_blocks[block.index] = block.data
                         state.camera_progress["blocks_received"] += 1
                         state.camera_progress["total_bytes"] += len(block.data)
                         state.camera_progress["elapsed_seconds"] = elapsed
@@ -228,14 +233,32 @@ def trigger_camera_capture(timeout: float = 30.0) -> None:
                         speed = round(state.camera_progress["total_bytes"] / max(0.01, elapsed), 1)
                         state.camera_progress["transfer_speed_bps"] = speed
 
+                        # Assemble contiguous progressive blocks sorted strictly: 0, 1, 2, ...
+                        contiguous = bytearray()
+                        idx = 0
+                        while idx in state.camera_blocks:
+                            contiguous.extend(state.camera_blocks[idx])
+                            idx += 1
+
+                        partial_b64 = None
+                        if len(contiguous) >= 2 and contiguous[:2] == b"\xff\xd8":
+                            if contiguous.find(b"\xff\xd9") < 0:
+                                partial_jpeg = bytes(contiguous) + b"\xff\xd9"
+                            else:
+                                partial_jpeg = bytes(contiguous)
+                            state.partial_image = partial_jpeg
+                            partial_b64 = base64.b64encode(partial_jpeg).decode("ascii")
+
                         chunk_record = {
                             "type": "camera_chunk",
                             "index": block.index,
                             "size": len(block.data),
                             "total_blocks": state.camera_progress["blocks_received"],
+                            "contiguous_blocks": idx,
                             "total_bytes": state.camera_progress["total_bytes"],
                             "elapsed_seconds": elapsed,
                             "hex_preview": block.data[:16].hex().upper(),
+                            "partial_jpeg_base64": partial_b64,
                             "timestamp": now,
                         }
                         state.camera_chunks.append(chunk_record)
@@ -446,14 +469,33 @@ def background_sdr_receiver_loop(
                                                 speed = round(state.camera_progress["total_bytes"] / max(0.01, elapsed), 1)
                                                 state.camera_progress["transfer_speed_bps"] = speed
 
+                                                state.camera_blocks[blk_idx] = blk_data
+                                                # Assemble contiguous progressive blocks sorted strictly: 0, 1, 2, ...
+                                                contiguous = bytearray()
+                                                idx = 0
+                                                while idx in state.camera_blocks:
+                                                    contiguous.extend(state.camera_blocks[idx])
+                                                    idx += 1
+
+                                                partial_b64 = None
+                                                if len(contiguous) >= 2 and contiguous[:2] == b"\xff\xd8":
+                                                    if contiguous.find(b"\xff\xd9") < 0:
+                                                        partial_jpeg = bytes(contiguous) + b"\xff\xd9"
+                                                    else:
+                                                        partial_jpeg = bytes(contiguous)
+                                                    state.partial_image = partial_jpeg
+                                                    partial_b64 = base64.b64encode(partial_jpeg).decode("ascii")
+
                                                 chunk_record = {
                                                     "type": "camera_chunk",
                                                     "index": blk_idx,
                                                     "size": len(blk_data),
                                                     "total_blocks": state.camera_progress["blocks_received"],
+                                                    "contiguous_blocks": idx,
                                                     "total_bytes": state.camera_progress["total_bytes"],
                                                     "elapsed_seconds": elapsed,
                                                     "hex_preview": blk_data[:16].hex().upper(),
+                                                    "partial_jpeg_base64": partial_b64,
                                                     "timestamp": now,
                                                 }
                                                 with state.lock:
@@ -1579,7 +1621,7 @@ HTML_DASHBOARD = """<!DOCTYPE html>
       const speed = chunk.elapsed_seconds > 0 ? (chunk.total_bytes / chunk.elapsed_seconds).toFixed(0) : '0';
       speedMetric.innerText = `Speed: ${speed} B/s | Rate: ${rate} blk/s | Elapsed: ${chunk.elapsed_seconds}s`;
 
-      // Interactive Matrix Grid
+      // Interactive Matrix Grid (Strictly Sorted in Numerical Order)
       const matrix = document.getElementById('chunkMatrix');
       const countLabel = document.getElementById('chunkCountLabel');
       
@@ -1588,15 +1630,41 @@ HTML_DASHBOARD = """<!DOCTYPE html>
       if (!badge) {
         badge = document.createElement('span');
         badge.id = badgeId;
+        badge.setAttribute('data-index', chunk.index);
         badge.className = 'chunk-badge';
         badge.innerText = '#' + String(chunk.index).padStart(2, '0');
-        badge.title = `Block #${chunk.index} (${chunk.size} bytes)\nHex: ${chunk.hex_preview}...`;
-        matrix.appendChild(badge);
+        badge.title = `Block #${chunk.index} (${chunk.size} bytes)\nOffset: 0x${(chunk.index * 240).toString(16).toUpperCase()}\nHex: ${chunk.hex_preview}...`;
+        
+        // Insert in ascending numerical order
+        const children = Array.from(matrix.children);
+        let inserted = false;
+        for (let child of children) {
+          const childIdx = parseInt(child.getAttribute('data-index') || '-1', 10);
+          if (chunk.index < childIdx) {
+            matrix.insertBefore(badge, child);
+            inserted = true;
+            break;
+          }
+        }
+        if (!inserted) matrix.appendChild(badge);
         receivedChunks.add(chunk.index);
       } else {
         badge.className = 'chunk-badge duplicate';
       }
       countLabel.innerText = `${receivedChunks.size} blocks received`;
+
+      // Progressive Live Image Rendering per block
+      if (chunk.partial_jpeg_base64) {
+        const img = document.getElementById('cameraImgPreview');
+        const placeholder = document.getElementById('cameraPlaceholder');
+        const meta = document.getElementById('cameraMetaInfo');
+
+        img.src = 'data:image/jpeg;base64,' + chunk.partial_jpeg_base64;
+        img.style.display = 'block';
+        placeholder.style.display = 'none';
+        meta.style.display = 'block';
+        meta.innerText = `[Progressive Reconstruction] Contiguous Blocks: 0..${(chunk.contiguous_blocks || chunk.total_blocks) - 1} | Buffer: ${(chunk.total_bytes / 1024).toFixed(1)} KB`;
+      }
 
       // Progress bar estimation
       const estTotalBlocks = Math.max(35, chunk.index + 5);
@@ -2133,12 +2201,12 @@ class GroundStationAPIHandler(BaseHTTPRequestHandler):
             return
 
         # 12. Latest Camera Image (Raw JPEG Binary)
-        if path in ("/api/camera/latest.jpg", "/api/camera/image"):
+        if path in ("/api/camera/latest.jpg", "/api/camera/image", "/api/camera/partial.jpg"):
             with state.lock:
-                if state.latest_image is None:
-                    self._send_json(HTTPStatus.NOT_FOUND, {"error": "No camera image captured yet"})
+                img_data = state.latest_image or state.partial_image
+                if img_data is None:
+                    self._send_json(HTTPStatus.NOT_FOUND, {"error": "No camera image or partial buffer available yet"})
                     return
-                img_data = state.latest_image
             self.send_response(HTTPStatus.OK)
             self.send_header("Content-Type", "image/jpeg")
             self.send_header("Content-Length", str(len(img_data)))
