@@ -190,13 +190,13 @@ def background_telemetry_loop(port: str, serial_number: int) -> None:
         print(f"[API Backend] Disconnected from {port}")
 
 
-def trigger_camera_capture(timeout: float = 30.0) -> None:
-    """Initiates a background thread to capture JPEG camera image from satellite."""
+def trigger_camera_capture(timeout: float = 30.0, source: str = "server") -> None:
+    """Spawns an asynchronous worker to handle camera capture."""
     global state
     with state.camera_lock:
         if state.camera_status == "capturing":
             raise SessionBusyError("A camera capture session is already in progress")
-        if not state.is_connected and not state.sdr_active and state.cube is None:
+        if source != "client_web_serial" and not state.is_connected and not state.sdr_active and state.cube is None:
             raise ConnectionError(
                 "Receiver is not connected to a satellite. Please connect via Client Web USB (Tab 1), "
                 "Server COM Port (Tab 2), or PlutoSDR (Tab 3) first."
@@ -220,6 +220,23 @@ def trigger_camera_capture(timeout: float = 30.0) -> None:
     def _worker() -> None:
         start_time = time.time()
         try:
+            if source == "client_web_serial":
+                print("[API WebUSB] Camera capture session started. Waiting for chunks from Browser Web USB...")
+                while time.time() - start_time < timeout:
+                    with state.camera_lock:
+                        if state.camera_status == "completed":
+                            print(f"[API WebUSB] Camera capture completed: {len(state.latest_image or b'')} bytes")
+                            return
+                        if state.camera_status == "failed":
+                            return
+                    time.sleep(0.2)
+
+                with state.camera_lock:
+                    if state.camera_status == "capturing":
+                        state.camera_status = "failed"
+                        state.camera_progress["error"] = f"Camera capture timed out after {timeout:.1f}s"
+                return
+
             if state.cube is not None:
                 def on_block(block: Any) -> None:
                     now = time.time()
@@ -1693,6 +1710,27 @@ HTML_DASHBOARD = """<!DOCTYPE html>
       document.getElementById('cameraSpeedMetric').innerText = 'Speed: 0 B/s | Rate: 0 blk/s';
 
       try {
+        if (isClientConnected && clientPort && clientPort.writable) {
+          // Send camera trigger command to USB dongle: Port 0x13, Len 0x01, Payload 0x00
+          const writer = clientPort.writable.getWriter();
+          const cmd = new Uint8Array([0x13, 0x01, 0x00]);
+          await writer.write(cmd);
+          writer.releaseLock();
+
+          // Inform backend of client web serial capture session
+          fetch('/api/camera/capture', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({ timeout: 35.0, source: 'client_web_serial' })
+          }).catch(console.warn);
+
+          document.getElementById('cameraProgressContainer').style.display = 'block';
+          document.getElementById('cameraStatusText').innerText = 'Status: Capturing via Web USB...';
+          if (cameraPollingInterval) clearInterval(cameraPollingInterval);
+          cameraPollingInterval = setInterval(pollCameraStatus, 800);
+          return;
+        }
+
         const res = await fetch('/api/camera/capture', {
           method: 'POST',
           headers: {'Content-Type': 'application/json'},
@@ -1870,42 +1908,54 @@ HTML_DASHBOARD = """<!DOCTYPE html>
               merged.set(value, buffer.length);
               buffer = merged;
 
-              // Cari header 0x10 0x79 (panjang 123 bytes)
-              while (buffer.length >= 123) {
-                let headerIdx = -1;
-                for (let i = 0; i <= buffer.length - 123; i++) {
-                  if (buffer[i] === 0x10 && buffer[i + 1] === 0x79) {
-                    headerIdx = i;
-                    break;
-                  }
-                }
-                if (headerIdx === -1) {
-                  // Simpan 2 byte terakhir untuk mengantisipasi header terpotong
-                  buffer = buffer.slice(-2);
-                  break;
-                }
-
-                if (buffer.length >= headerIdx + 123) {
-                  const frame = buffer.slice(headerIdx, headerIdx + 123);
-                  buffer = buffer.slice(headerIdx + 123);
-
-                  const hex = Array.from(frame)
-                    .map(b => b.toString(16).padStart(2, '0'))
-                    .join('')
-                    .toUpperCase();
-
-                  // Push ke backend via /api/telemetry/ingest
+              // Parse frames in buffer
+              while (buffer.length >= 2) {
+                // 1. Port 0x10 Telemetry (123 bytes: 0x10, 0x79)
+                if (buffer[0] === 0x10 && buffer[1] === 0x79) {
+                  if (buffer.length < 123) break;
+                  const frame = buffer.slice(0, 123);
+                  buffer = buffer.slice(123);
+                  const hex = Array.from(frame).map(b => b.toString(16).padStart(2, '0')).join('').toUpperCase();
                   fetch('/api/telemetry/ingest', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ hex, source: 'client_web_serial' })
                   })
                   .then(r => r.json())
-                  .then(res => {
-                    if (res.telemetry) renderTelemetry(res.telemetry);
-                  })
+                  .then(res => { if (res.telemetry) renderTelemetry(res.telemetry); })
                   .catch(console.error);
+                  continue;
+                }
+
+                // 2. Port 0x20 Camera Block (244 bytes: 0x20, 0xF2)
+                if (buffer[0] === 0x20 && buffer[1] === 0xF2) {
+                  if (buffer.length < 244) break;
+                  const frame = buffer.slice(0, 244);
+                  buffer = buffer.slice(244);
+                  const hex = Array.from(frame).map(b => b.toString(16).padStart(2, '0')).join('').toUpperCase();
+                  fetch('/api/camera/chunk/ingest', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ hex, source: 'client_web_serial' })
+                  })
+                  .then(r => r.json())
+                  .then(res => { if (res.chunk) renderCameraChunk(res.chunk); })
+                  .catch(console.error);
+                  continue;
+                }
+
+                // Search next header candidate if current byte is not a known header
+                let nextHeaderIdx = -1;
+                for (let i = 1; i < buffer.length; i++) {
+                  if ((buffer[i] === 0x10 && buffer[i+1] === 0x79) || (buffer[i] === 0x20 && buffer[i+1] === 0xF2)) {
+                    nextHeaderIdx = i;
+                    break;
+                  }
+                }
+                if (nextHeaderIdx !== -1) {
+                  buffer = buffer.slice(nextHeaderIdx);
                 } else {
+                  buffer = buffer.slice(-2);
                   break;
                 }
               }
@@ -2302,13 +2352,84 @@ class GroundStationAPIHandler(BaseHTTPRequestHandler):
             self._send_json(HTTPStatus.OK, {"status": "disconnected"})
             return
 
-        # 3. Ingest Telemetry from Client Web Serial
-        if path == "/api/telemetry/ingest":
+        # 3. Ingest Telemetry or Camera Chunks from Client Web Serial
+        if path in ("/api/telemetry/ingest", "/api/camera/chunk/ingest"):
             hex_data = body_json.get("hex") or body_json.get("payload") or raw_body.strip().strip('"')
             if not hex_data:
                 self._send_json(HTTPStatus.BAD_REQUEST, {"error": "Missing 'hex' in request body"})
                 return
             try:
+                raw_bytes = bytes.fromhex(hex_data)
+                port = raw_bytes[0] if len(raw_bytes) > 0 else None
+
+                # Check if it's a Camera Block (0x20)
+                if port == 0x20:
+                    payload = raw_bytes[2:] if len(raw_bytes) > 2 else raw_bytes
+                    if len(payload) >= 2:
+                        blk_idx = struct.unpack_from("<H", payload, 0)[0]
+                        blk_data = payload[2:]
+                        block = CameraBlock(index=blk_idx, data=blk_data, metadata=None)
+                        with state.camera_lock:
+                            jpeg_res = state.camera_assembler.add(block)
+                            now = time.time()
+                            started_at = state.camera_progress.get("started_at") or now
+                            elapsed = round(now - started_at, 2)
+                            state.camera_progress["blocks_received"] += 1
+                            state.camera_progress["total_bytes"] += len(blk_data)
+                            state.camera_progress["elapsed_seconds"] = elapsed
+                            state.camera_progress["latest_block_index"] = blk_idx
+                            speed = round(state.camera_progress["total_bytes"] / max(0.01, elapsed), 1)
+                            state.camera_progress["transfer_speed_bps"] = speed
+
+                            state.camera_blocks[blk_idx] = blk_data
+                            # Assemble contiguous progressive blocks sorted strictly: 0, 1, 2, ...
+                            contiguous = bytearray()
+                            idx = 0
+                            while idx in state.camera_blocks:
+                                contiguous.extend(state.camera_blocks[idx])
+                                idx += 1
+
+                            partial_b64 = None
+                            if len(contiguous) >= 2 and contiguous[:2] == b"\xff\xd8":
+                                if contiguous.find(b"\xff\xd9") < 0:
+                                    partial_jpeg = bytes(contiguous) + b"\xff\xd9"
+                                else:
+                                    partial_jpeg = bytes(contiguous)
+                                state.partial_image = partial_jpeg
+                                partial_b64 = base64.b64encode(partial_jpeg).decode("ascii")
+
+                            chunk_record = {
+                                "type": "camera_chunk",
+                                "index": blk_idx,
+                                "size": len(blk_data),
+                                "total_blocks": state.camera_progress["blocks_received"],
+                                "contiguous_blocks": idx,
+                                "total_bytes": state.camera_progress["total_bytes"],
+                                "elapsed_seconds": elapsed,
+                                "hex_preview": blk_data[:16].hex().upper(),
+                                "partial_jpeg_base64": partial_b64,
+                                "timestamp": now,
+                            }
+                            with state.lock:
+                                state.camera_chunks.append(chunk_record)
+
+                            state.broadcast_camera_chunk(chunk_record)
+
+                            if jpeg_res is not None:
+                                state.latest_image = jpeg_res
+                                state.latest_image_metadata = {
+                                    "block_count": state.camera_assembler.block_count,
+                                    "duplicate_blocks": len(state.camera_assembler.duplicates),
+                                    "byte_length": len(jpeg_res),
+                                    "captured_at": time.time(),
+                                    "capture_duration_seconds": elapsed,
+                                }
+                                state.camera_status = "completed"
+                                print(f"[API WebUSB] Camera JPEG complete: {len(jpeg_res)} bytes")
+                        self._send_json(HTTPStatus.OK, {"status": "camera_chunk_ingested", "chunk": chunk_record})
+                        return
+
+                # Otherwise standard Telemetry (0x10)
                 decoded = decode_telemetry_to_dict(hex_data)
                 decoded["raw_hex"] = hex_data if isinstance(hex_data, str) else hex_data.hex().upper()
                 decoded["timestamp"] = time.time()
@@ -2322,10 +2443,12 @@ class GroundStationAPIHandler(BaseHTTPRequestHandler):
         # 4. Trigger Camera Capture
         if path == "/api/camera/capture":
             timeout_val = float(body_json.get("timeout", 35.0))
+            source_val = str(body_json.get("source", "server"))
             try:
-                trigger_camera_capture(timeout=timeout_val)
+                trigger_camera_capture(timeout=timeout_val, source=source_val)
                 self._send_json(HTTPStatus.ACCEPTED, {
                     "status": "capturing",
+                    "source": source_val,
                     "message": f"Camera capture initiated with {timeout_val:.1f}s timeout",
                     "check_status_url": "/api/camera/status",
                 })
