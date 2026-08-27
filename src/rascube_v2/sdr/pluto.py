@@ -241,3 +241,107 @@ class PlutoSDRReceiver:
             self._thread.join(timeout=1.0)
         self._sdr_device = None
         print("[Pluto+ SDR] Receiver stopped.")
+
+
+def generate_lora_tx_waveform(
+    payload: bytes,
+    sf: int = 7,
+    bw: int = 500_000,
+    samp_rate: int = 1_000_000,
+    sync_words: list[int] = [0x12],
+) -> np.ndarray:
+    """Generates standard-compliant LoRa IQ samples using GNU Radio DSP blocks with software fallback."""
+    try:
+        import pmt
+        from gnuradio import blocks, gr
+        from gnuradio.lora_sdr import lora_sdr_python as lora_sdr
+
+        tb = gr.top_block("LoRaTxGen")
+        msg = pmt.intern(payload.hex())
+        strobe = blocks.message_strobe(msg, 20)
+        whitening = lora_sdr.whitening(True, False, ",", "packet_len")
+        header = lora_sdr.header(False, True, 1)
+        add_crc = lora_sdr.add_crc(True)
+        hamming_enc = lora_sdr.hamming_enc(1, sf)
+        interleaver = lora_sdr.interleaver(1, sf, 0, bw)
+        gray_demap = lora_sdr.gray_demap(sf)
+        zero_pad = int(20 * (2**sf) * samp_rate / bw)
+        modulate = lora_sdr.modulate(sf, samp_rate, bw, sync_words, zero_pad, 8)
+        sink = blocks.vector_sink_c()
+
+        tb.msg_connect((strobe, "strobe"), (whitening, "msg"))
+        tb.connect((whitening, 0), (header, 0))
+        tb.connect((header, 0), (add_crc, 0))
+        tb.connect((add_crc, 0), (hamming_enc, 0))
+        tb.connect((hamming_enc, 0), (interleaver, 0))
+        tb.connect((interleaver, 0), (gray_demap, 0))
+        tb.connect((gray_demap, 0), (modulate, 0))
+        tb.connect((modulate, 0), (sink, 0))
+
+        tb.start()
+        time.sleep(0.25)
+        tb.stop()
+        tb.wait()
+
+        iq_data = np.array(sink.data(), dtype=np.complex64)
+        max_val = np.max(np.abs(iq_data))
+        if max_val > 0:
+            return ((iq_data / max_val) * 0.9 * 32767.0).astype(np.complex64)
+        return iq_data
+    except Exception:
+        from rascube_v2.sdr.lora_dsp import SoftwareLoRaDSP
+
+        dsp = SoftwareLoRaDSP(spreading_factor=sf, bandwidth_hz=bw, sample_rate=samp_rate)
+        return dsp.modulate_bytes(payload)
+
+
+class PlutoSDRTransmitter:
+    """Uplink ground station transmitter for ADALM-PLUTO / Pluto+ SDR devices."""
+
+    def __init__(self, config: SDRLoRaConfig, tx_gain_db: float = 0.0) -> None:
+        self.config = config
+        self.tx_gain_db = tx_gain_db
+        self._sdr_device: Any = None
+
+    def connect(self) -> None:
+        import adi
+
+        uris_to_try = ["usb:", "ip:192.168.2.1", "ip:pluto.local", self.config.sdr_uri]
+        seen = set()
+        candidates = [u for u in uris_to_try if not (u in seen or seen.add(u))]
+
+        last_error = None
+        for uri in candidates:
+            try:
+                dev = adi.Pluto(uri)
+                dev.sample_rate = int(self.config.sample_rate)
+                dev.tx_lo = int(self.config.frequency_hz)
+                dev.tx_rf_bandwidth = int(self.config.bandwidth_hz * 2)
+                dev.tx_hardwaregain_chan0 = float(self.tx_gain_db)
+                self._sdr_device = dev
+                self.config.sdr_uri = uri
+                print(
+                    f"[Pluto+ SDR TX] Connected via '{uri}' @ {self.config.frequency_hz / 1e6:.3f} MHz",
+                    flush=True,
+                )
+                return
+            except Exception as exc:
+                last_error = exc
+
+        raise RuntimeError(f"Could not connect PlutoSDR TX on any URI: {last_error}")
+
+    def transmit_bytes(self, payload: bytes) -> None:
+        """Modulates payload bytes into LoRa CSS and transmits via PlutoSDR TX antenna."""
+        if self._sdr_device is None:
+            self.connect()
+        iq_tx = generate_lora_tx_waveform(
+            payload,
+            sf=self.config.spreading_factor,
+            bw=self.config.bandwidth_hz,
+            samp_rate=self.config.sample_rate,
+        )
+        if hasattr(self._sdr_device, "tx_destroy_buffer"):
+            self._sdr_device.tx_destroy_buffer()
+        self._sdr_device.tx_cyclic_buffer = False
+        self._sdr_device.tx(iq_tx)
+

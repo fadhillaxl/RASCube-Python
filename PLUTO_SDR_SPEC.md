@@ -171,3 +171,60 @@ def on_telemetry(sample):
 receiver = PlutoSDRReceiver(config=config, on_sample=on_telemetry)
 receiver.start_direct_sdr()
 ```
+
+---
+
+## 6. Spesifikasi Transmisi Uplink (Command & Control)
+
+PlutoSDR mendukung transmisi uplink radio langsung ke satelit RASCube melalui port antena TX:
+
+### Protokol Framing Uplink (Radio Frame Format)
+Setiap perintah uplink dikemas dalam format 1-byte Port Header + 1-byte Panjang Payload + N-byte Payload:
+$$\text{Frame} = [\text{HostPort},\ \text{Length},\ \text{Payload}\dots]$$
+
+### Perintah Uplink yang Didukung:
+
+| Perintah / Aksi | HostPort (Hex) | Payload Format | Contoh Frame (Hex) | Deskripsi |
+|---|---|---|---|---|
+| **OBC Info / Wake-up Ping** | `0x12` | `0x00` (1 byte) | `12 01 00` | Membangunkan satelit dan memicu transmisi telemetri downlink |
+| **Set Arduino RGB LED** | `0x80` | `[R, G, B]` (3 bytes) | `80 03 FF 00 00` | Mengatur warna LED RGB satelit (Merah: `FF 00 00`, Hijau: `00 FF 00`) |
+| **Buzzer Startup Song** | `0x84` | `0x00` (1 byte) | `84 01 00` | Memainkan lagu startup buzzer satelit over-the-air |
+| **Buzzer Tone Custom** | `0x81` | `u16LE` frekuensi (Hz) | `81 02 E8 03` | Membunyikan buzzer pada frekuensi 1000 Hz |
+| **OBC Flash Settings** | `0x16` | `u8` flag | `16 01 01` | Mengatur konfigurasi flash memory OBC |
+| **Camera Capture Trigger** | `0x13` | `0x00` (1 byte) | `13 01 00` | Memicu pengambilan gambar kamera onboard |
+
+---
+
+## 7. Penggunaan CLI Uplink Transmitter (`pluto_transmitter.py`)
+
+Gunakan tool [`examples/sdr/pluto_transmitter.py`](file:///Users/mm/GitHub/RASCube-Python/examples/sdr/pluto_transmitter.py) untuk mengirim perintah uplink via PlutoSDR TX:
+
+```bash
+# 1. Kirim Wake-up Ping ke Sat #1581 (925.0 MHz)
+python3 examples/sdr/pluto_transmitter.py --sat 1581 --ping
+
+# 2. Nyalakan LED RGB Hijau di satelit
+python3 examples/sdr/pluto_transmitter.py --sat 1581 --rgb 0 255 0
+
+# 3. Mainkan lagu startup buzzer di satelit
+python3 examples/sdr/pluto_transmitter.py --sat 1581 --song
+
+# 4. Mode Beacon Berkelanjutan (Kirim wake-up ping otomatis setiap 5 detik)
+python3 examples/sdr/pluto_transmitter.py --sat 1581 --beacon 5
+
+# 5. Kirim Raw Hex Frame kustom
+python3 examples/sdr/pluto_transmitter.py --sat 1581 --raw-hex 120100
+```
+
+### Python SDK Uplink Example:
+```python
+from rascube_v2.constants import HostPort
+from rascube_v2.sdr import PlutoSDRTransmitter, SDRLoRaConfig
+
+config = SDRLoRaConfig(serial_number=1581, bandwidth_hz=500_000, spreading_factor=7)
+tx = PlutoSDRTransmitter(config=config, tx_gain_db=0.0)
+
+# Kirim perintah RGB LED Merah (Port 0x80, len 3, [255, 0, 0])
+tx.transmit_bytes(bytes([HostPort.ARDUINO_RGB, 0x03, 255, 0, 0]))
+```
+
