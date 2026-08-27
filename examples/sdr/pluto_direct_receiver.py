@@ -191,7 +191,7 @@ def main() -> None:
                             total_decoded += 1
                             raw_pkt = decoded
                             if args.hex:
-                                print(f"[RX #{total_decoded}] {raw_pkt.hex().upper()}", flush=True)
+                                print(raw_pkt.hex().upper(), flush=True)
                             else:
                                 print(f"[RX #{total_decoded}] Frame len={len(raw_pkt)} bytes: {raw_pkt[:16].hex().upper()}...", flush=True)
 
