@@ -370,3 +370,47 @@ class PlutoSDRTransmitter:
             if rep < repeat - 1:
                 time.sleep(0.05)
 
+    def transmit_cyclic_beacon(
+        self,
+        payload: bytes,
+        *,
+        gap_seconds: float = 0.2,
+        add_address_header: bool = True,
+    ) -> None:
+        """Loads a continuous LoRa packet with a silent gap into PlutoSDR's FPGA DMA cyclic buffer.
+
+        The FPGA hardware will loop and transmit this packet continuously over the air,
+        emulating the USB Dongle's hardware wake-up & polling loop without host CPU overhead.
+        """
+        if self._sdr_device is None:
+            self.connect()
+
+        if add_address_header:
+            addr_header = struct.pack("<I", self.config.serial_number) + b"\x00"
+            full_tx_payload = addr_header + payload
+        else:
+            full_tx_payload = payload
+
+        iq_packet = generate_lora_tx_waveform(
+            full_tx_payload,
+            sf=self.config.spreading_factor,
+            bw=self.config.bandwidth_hz,
+            samp_rate=self.config.sample_rate,
+        )
+
+        n_gap_samples = int(self.config.sample_rate * gap_seconds)
+        silence = np.zeros(n_gap_samples, dtype=np.complex64)
+        iq_cyclic = np.concatenate((iq_packet, silence)).astype(np.complex64)
+
+        if hasattr(self._sdr_device, "tx_destroy_buffer"):
+            self._sdr_device.tx_destroy_buffer()
+
+        self._sdr_device.tx_cyclic_buffer = True
+        self._sdr_device.tx(iq_cyclic)
+
+    def stop_cyclic_beacon(self) -> None:
+        """Stops the FPGA DMA cyclic transmission."""
+        if self._sdr_device is not None and hasattr(self._sdr_device, "tx_destroy_buffer"):
+            self._sdr_device.tx_destroy_buffer()
+
+

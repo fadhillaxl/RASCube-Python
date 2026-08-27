@@ -45,6 +45,7 @@ def main() -> None:
 
     # Command options
     cmd_group = parser.add_mutually_exclusive_group(required=True)
+    cmd_group.add_argument("--wake", action="store_true", help="Hardware FPGA continuous cyclic beacon to wake up and keep satellite active without dongle")
     cmd_group.add_argument("--ping", action="store_true", help="Send OBC Info / Wake-up ping")
     cmd_group.add_argument("--rgb", nargs=3, type=int, metavar=("R", "G", "B"), help="Set satellite RGB LED (0-255)")
     cmd_group.add_argument("--song", action="store_true", help="Play satellite startup sound")
@@ -77,7 +78,21 @@ def main() -> None:
     transmitter.connect()
 
     # Determine payload to send
-    if args.ping:
+    if args.wake:
+        payload = bytes([HostPort.OBC_INFO, 0x01, 0x00])
+        print(f"\n[Hardware DMA Wake Mode] Loading continuous LoRa wake-up beacon into PlutoSDR FPGA DMA...", flush=True)
+        transmitter.transmit_cyclic_beacon(payload, gap_seconds=0.15)
+        print(f"🚀 PlutoSDR FPGA is now continuously broadcasting hardware wake-up beacons to Sat #{args.sat}!")
+        print("💡 The satellite will detect this continuous carrier, wake up, and start transmitting telemetry.")
+        print("Press Ctrl+C to stop FPGA cyclic transmission...\n")
+        try:
+            while True:
+                time.sleep(1)
+        except KeyboardInterrupt:
+            transmitter.stop_cyclic_beacon()
+            print("\nHardware cyclic beacon stopped.")
+
+    elif args.ping:
         payload = bytes([HostPort.OBC_INFO, 0x01, 0x00])
         print(f"\n[Uplink TX] Sending OBC_INFO wake-up request (0x{payload.hex().upper()})...", flush=True)
         transmitter.transmit_bytes(payload, repeat=args.repeat)
@@ -143,4 +158,5 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
 
