@@ -24,7 +24,8 @@ import argparse
 import sys
 import time
 
-from rascube_v2.models.firmware import FirmwareInfo, ObcInfo, ReceiverInfo
+from rascube_v2.models.obc import FirmwareInfo, ObcInfo
+from rascube_v2.models.receiver import ReceiverInfo
 from rascube_v2.models.telemetry import MainTelemetrySample
 from rascube_v2.sdr.pluto import PlutoSDRReceiver, SDRLoRaConfig
 
