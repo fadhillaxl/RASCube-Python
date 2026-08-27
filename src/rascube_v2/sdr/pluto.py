@@ -184,9 +184,12 @@ class PlutoSDRReceiver:
             return
         try:
             iq_tx = self._dsp.modulate_bytes(payload)
+            if hasattr(self._sdr_device, "tx_destroy_buffer"):
+                self._sdr_device.tx_destroy_buffer()
+            self._sdr_device.tx_cyclic_buffer = False
             self._sdr_device.tx(iq_tx)
         except Exception as exc:
-            print(f"[Pluto+ SDR TX] Transmit error: {exc}")
+            print(f"[Pluto+ SDR TX] Transmit error: {exc}", flush=True)
 
     def start_udp_listener(self, host: str = "127.0.0.1", port: int = 9090) -> None:
         """Listen for demodulated telemetry frames from GNU Radio / gr-lorasdr via UDP."""
