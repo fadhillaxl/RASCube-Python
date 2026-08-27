@@ -101,7 +101,7 @@ def main() -> None:
 import sys
 sys.path.insert(0, '/opt/homebrew/lib/python3.14/site-packages')
 import pmt, socket
-from gnuradio import gr, network
+from gnuradio import gr, network, blocks
 from gnuradio.lora_sdr import lora_sdr_lora_rx
 
 class FrameForwarder(gr.sync_block):
