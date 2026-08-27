@@ -95,14 +95,18 @@ def main() -> None:
     if receivers:
         try:
             from rascube_v2.sync import RASCube as SyncCube
-            with SyncCube(receivers[0].port, serial_number=serial_number) as cube:
-                print(f"\n[Ground Link Active] Connected to satellite #{serial_number} via receiver hardware.", flush=True)
+            with SyncCube(receivers[0].device, serial_number=serial_number) as cube:
+                receiver_info = cube.receiver.get_info()
+                obc_info = cube.obc.get_info()
+                print("Receiver:", receiver_info, flush=True)
+                print("OBC:", obc_info, flush=True)
+                print("Enabled add-ons: []", flush=True)
                 for sample in cube.telemetry.iter_samples(timeout=15):
                     if args.hex:
                         print(f"1079{sample.device_uptime_ms:08X}...", flush=True)
                     else:
                         print(f"{sample.device_uptime_ms} {sample.gps.latitude} {sample.gps.longitude}", flush=True)
-        except Exception:
+        except Exception as exc:
             pass
 
     # 3. Connect directly to PlutoSDR hardware
