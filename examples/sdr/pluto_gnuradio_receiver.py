@@ -126,7 +126,7 @@ def main() -> None:
                 pay_len=121,
                 samp_rate=1_000_000,
                 sf=int(args.sf),
-                sync_word=[0x34],
+                sync_word=[0x12, 0x34],
                 soft_decoding=True,
                 ldro_mode=0,
                 print_rx=[False, False],
