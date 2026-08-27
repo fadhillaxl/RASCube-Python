@@ -100,7 +100,15 @@ class PlutoSDRReceiver:
         self._sdr_device.rx_rf_bandwidth = int(self.config.bandwidth_hz * 2)
         self._sdr_device.gain_control_mode_chan0 = "manual"
         self._sdr_device.rx_hardwaregain_chan0 = float(self.config.rx_gain_db)
-        self._sdr_device.rx_buffer_size = 16384
+        self._sdr_device.rx_buffer_size = 65536
+
+        # Setup TX if available
+        try:
+            self._sdr_device.tx_lo = int(self.config.frequency_hz)
+            self._sdr_device.tx_rf_bandwidth = int(self.config.bandwidth_hz * 2)
+            self._sdr_device.tx_hardwaregain_chan0 = 0.0
+        except Exception:
+            pass
 
         print(
             f"[Pluto+ SDR] Connected successfully ({self.config.sdr_uri})!\n"
@@ -108,13 +116,63 @@ class PlutoSDRReceiver:
             f"(Channel {self.config.serial_number % 18}), Gain: {self.config.rx_gain_db} dB"
         )
 
+        from rascube_v2.sdr.lora_dsp import SoftwareLoRaDSP
+        self._dsp = SoftwareLoRaDSP(
+            spreading_factor=self.config.spreading_factor,
+            bandwidth_hz=self.config.bandwidth_hz,
+            sample_rate=self.config.sample_rate,
+        )
+
+        # Start live SDR RX worker
+        self._running = True
+        self._thread = threading.Thread(target=self._sdr_rx_worker, daemon=True)
+        self._thread.start()
+
+    def _sdr_rx_worker(self) -> None:
+        """Continuously reads raw I/Q samples from Pluto+ SDR and demodulates LoRa packets."""
+        while self._running and self._sdr_device is not None:
+            try:
+                # Read I/Q buffer from Pluto+ SDR hardware
+                iq_data = self._sdr_device.rx()
+                if iq_data is None or len(iq_data) == 0:
+                    time.sleep(0.01)
+                    continue
+
+                # Run DSP demodulation on I/Q samples
+                packets = self._dsp.demodulate_samples(iq_data)
+                for pkt in packets:
+                    self.total_packets_received += 1
+                    hex_str = pkt.hex().upper()
+                    if self.on_raw_hex:
+                        self.on_raw_hex(hex_str)
+                    if self.on_sample:
+                        try:
+                            sample = decode_main_telemetry_hex(pkt)
+                            self.on_sample(sample)
+                        except Exception:
+                            pass
+
+            except Exception as exc:
+                if self._running:
+                    time.sleep(0.05)
+
+    def transmit_packet(self, payload: bytes) -> None:
+        """Modulates and transmits a LoRa packet via Pluto+ SDR TX antenna."""
+        if self._sdr_device is None or self._dsp is None:
+            return
+        try:
+            iq_tx = self._dsp.modulate_bytes(payload)
+            self._sdr_device.tx(iq_tx)
+        except Exception as exc:
+            print(f"[Pluto+ SDR TX] Transmit error: {exc}")
+
     def start_udp_listener(self, host: str = "127.0.0.1", port: int = 9090) -> None:
         """Listen for demodulated telemetry frames from GNU Radio / gr-lorasdr via UDP."""
         self._running = True
-        self._thread = threading.Thread(
+        self._udp_thread = threading.Thread(
             target=self._udp_listen_worker, args=(host, port), daemon=True
         )
-        self._thread.start()
+        self._udp_thread.start()
         print(f"[SDR UDP Bridge] Listening for demodulated packets on {host}:{port}...")
 
     def _udp_listen_worker(self, host: str, port: int) -> None:
