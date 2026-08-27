@@ -68,20 +68,30 @@ class PlutoSDRReceiver:
                 "Install with: pip install pyadi-iio"
             ) from exc
 
-        uris_to_try = [self.config.sdr_uri]
-        for candidate in ["usb:", "ip:pluto.local", "ip:192.168.2.1"]:
-            if candidate not in uris_to_try:
-                uris_to_try.append(candidate)
+        uris_to_try = ["usb:", "ip:192.168.2.1", "ip:pluto.local", self.config.sdr_uri]
+        seen = set()
+        candidates = [u for u in uris_to_try if not (u in seen or seen.add(u))]
 
         connected_device = None
         last_error = None
 
-        for uri in uris_to_try:
+        for uri in candidates:
             try:
-                print(f"[Pluto+ SDR] Trying to connect via '{uri}'...")
-                connected_device = adi.Pluto(uri)
-                self.config.sdr_uri = uri
-                break
+                print(f"[Pluto+ SDR] Trying to connect via '{uri}'...", flush=True)
+                dev = adi.Pluto(uri)
+                dev.sample_rate = int(self.config.sample_rate)
+                dev.rx_lo = int(self.config.frequency_hz)
+                dev.rx_rf_bandwidth = int(self.config.bandwidth_hz * 2)
+                dev.gain_control_mode_chan0 = "manual"
+                dev.rx_hardwaregain_chan0 = float(self.config.rx_gain_db)
+                dev.rx_buffer_size = 32768
+
+                # Verify actual buffer read succeeds
+                test_buf = dev.rx()
+                if test_buf is not None and len(test_buf) > 0:
+                    connected_device = dev
+                    self.config.sdr_uri = uri
+                    break
             except Exception as exc:
                 last_error = exc
 
