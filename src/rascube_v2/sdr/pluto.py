@@ -142,24 +142,30 @@ class PlutoSDRReceiver:
         self._thread.start()
 
     def _sdr_rx_worker(self) -> None:
-        """Continuous background thread reading Pluto+ SDR raw I/Q samples and feeding DSP/UDP."""
-        udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        """Continuous background thread streaming Pluto+ SDR raw I/Q samples to GNU Radio via TCP."""
+        tcp_sock = None
         while self._running and self._sdr_device is not None:
             try:
+                if tcp_sock is None:
+                    try:
+                        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                        s.settimeout(0.5)
+                        s.connect(("127.0.0.1", 9090))
+                        tcp_sock = s
+                    except Exception:
+                        tcp_sock = None
+
                 iq_data = self._sdr_device.rx()
                 if iq_data is None or len(iq_data) == 0:
-                    time.sleep(0.005)
+                    time.sleep(0.002)
                     continue
 
-                # Forward raw complex64 I/Q to local DSP receiver
-                try:
-                    raw_c64 = iq_data.astype(np.complex64).tobytes()
-                    # Chunk into standard UDP packet size (1472 bytes = 184 complex64)
-                    chunk_size = 1472
-                    for i in range(0, len(raw_c64), chunk_size):
-                        udp_sock.sendto(raw_c64[i : i + chunk_size], ("127.0.0.1", 9090))
-                except Exception:
-                    pass
+                if tcp_sock is not None:
+                    try:
+                        raw_c64 = iq_data.astype(np.complex64).tobytes()
+                        tcp_sock.sendall(raw_c64)
+                    except Exception:
+                        tcp_sock = None
 
                 # Also run software DSP
                 if self._dsp is not None:
@@ -177,7 +183,7 @@ class PlutoSDRReceiver:
                                 pass
             except Exception:
                 if self._running:
-                    time.sleep(0.05)
+                    time.sleep(0.01)
                 else:
                     break
 

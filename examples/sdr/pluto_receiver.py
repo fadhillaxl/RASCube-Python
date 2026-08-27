@@ -128,7 +128,8 @@ class FrameForwarder(gr.sync_block):
         self.sock.sendto(raw, ('127.0.0.1', 9091))
 
 tb = gr.top_block('LoRaRX')
-src = network.udp_source(8, 1, 9090, 0, 1472, False, False, False)
+from gnuradio.network.tcp_source import tcp_source
+src = tcp_source(8, '127.0.0.1', 9090, True)
 rx = lora_sdr_lora_rx(
     center_freq={int(freq_mhz * 1e6)},
     bw={int(args.bw)},
@@ -151,7 +152,7 @@ tb.run()
         ]
         import subprocess
         gr_proc = subprocess.Popen(gr_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        time.sleep(0.3)
+        time.sleep(0.5)
     except Exception:
         pass
 
@@ -160,14 +161,18 @@ tb.run()
         receiver.start_direct_sdr()
         receiver.start_udp_listener(port=9091)
 
-        # Transmit LoRa wake-up handshake beacon to Satellite on 925.0 MHz
+        # Transmit LoRa wake-up handshake beacon to Satellite
+        def send_ping():
+            import struct
+            try:
+                receiver.transmit_packet(bytes([0x01, 0x04]) + struct.pack("<I", serial_number))
+                time.sleep(0.05)
+                receiver.transmit_packet(bytes([0x0C, 0x01, 0x00]))
+            except Exception:
+                pass
+
         print(f"[Pluto+ SDR TX] Transmitting wake-up beacon to Sat #{serial_number}...", flush=True)
-        import struct
-        # 1. Port 1 Serial Filter beacon
-        receiver.transmit_packet(bytes([0x01, 0x04]) + struct.pack("<I", serial_number))
-        time.sleep(0.1)
-        # 2. Port 12 OBC Info ping request
-        receiver.transmit_packet(bytes([0x0C, 0x01, 0x00]))
+        send_ping()
     except Exception as exc:
         print(f"\n[PlutoSDR Error] {exc}", flush=True)
         receiver.start_udp_listener(port=9091)
@@ -175,8 +180,13 @@ tb.run()
     print(f"\nStreaming live telemetry from Sat #{serial_number} via PlutoSDR (Ctrl+C to stop)...\n", flush=True)
 
     try:
+        last_ping = time.time()
         while True:
             time.sleep(1)
+            # Periodic keep-alive ping every 5 seconds if running
+            if time.time() - last_ping > 5.0:
+                send_ping()
+                last_ping = time.time()
     except KeyboardInterrupt:
         print("\nStopping PlutoSDR receiver...", flush=True)
         if gr_proc:
