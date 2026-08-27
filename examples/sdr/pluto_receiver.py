@@ -147,6 +147,15 @@ tb.run()
     try:
         receiver.start_direct_sdr()
         receiver.start_udp_listener(port=9091)
+
+        # Transmit LoRa wake-up handshake beacon to Satellite on 925.0 MHz
+        print(f"[Pluto+ SDR TX] Transmitting wake-up beacon to Sat #{serial_number}...", flush=True)
+        import struct
+        # 1. Port 1 Serial Filter beacon
+        receiver.transmit_packet(bytes([0x01, 0x04]) + struct.pack("<I", serial_number))
+        time.sleep(0.1)
+        # 2. Port 12 OBC Info ping request
+        receiver.transmit_packet(bytes([0x0C, 0x01, 0x00]))
     except Exception as exc:
         print(f"\n[PlutoSDR Error] {exc}", flush=True)
         receiver.start_udp_listener(port=9091)
