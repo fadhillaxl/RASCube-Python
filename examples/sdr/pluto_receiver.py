@@ -55,17 +55,17 @@ def main() -> None:
         arduino_info_cached=False,
     )
 
-    print("Receiver:", receiver_info)
-    print("OBC:", obc_info)
-    print("Enabled add-ons: []")
+    print("Receiver:", receiver_info, flush=True)
+    print("OBC:", obc_info, flush=True)
+    print("Enabled add-ons: []", flush=True)
 
-    print("=" * 65)
-    print("🛰️ PlutoSDR (ADALM-PLUTO) Ground Station Receiver")
-    print(f"📡 Target Satellite : #{serial_number}")
-    print(f"📻 Target Frequency : {freq_mhz:.3f} MHz (Channel {channel})")
-    print(f"⚙️ LoRa Modulation  : SF={args.sf}, BW={args.bw/1000:.1f} kHz, CR=4/5")
-    print(f"📋 Output Format    : {'Raw HEX Packets' if args.hex else 'Uptime, Lat, Lon'}")
-    print("=" * 65)
+    print("=" * 65, flush=True)
+    print("🛰️ PlutoSDR (ADALM-PLUTO) Ground Station Receiver", flush=True)
+    print(f"📡 Target Satellite : #{serial_number}", flush=True)
+    print(f"📻 Target Frequency : {freq_mhz:.3f} MHz (Channel {channel})", flush=True)
+    print(f"⚙️ LoRa Modulation  : SF={args.sf}, BW={args.bw/1000:.1f} kHz, CR=4/5", flush=True)
+    print(f"📋 Output Format    : {'Raw HEX Packets' if args.hex else 'Uptime, Lat, Lon'}", flush=True)
+    print("=" * 65, flush=True)
 
     config = SDRLoRaConfig(
         serial_number=serial_number,
@@ -77,11 +77,11 @@ def main() -> None:
 
     def on_raw_hex(hex_str: str) -> None:
         if args.hex:
-            print(hex_str)
+            print(hex_str, flush=True)
 
     def on_sample(sample: MainTelemetrySample) -> None:
         if not args.hex:
-            print(f"{sample.device_uptime_ms} {sample.gps.latitude} {sample.gps.longitude}")
+            print(f"{sample.device_uptime_ms} {sample.gps.latitude} {sample.gps.longitude}", flush=True)
 
     receiver = PlutoSDRReceiver(
         config=config,
@@ -96,22 +96,12 @@ def main() -> None:
         try:
             from rascube_v2.sync import RASCube as SyncCube
             with SyncCube(receivers[0].port, serial_number=serial_number) as cube:
-                receiver_info = cube.receiver.get_info()
-                obc_info = cube.obc.get_info()
-                print("Receiver:", receiver_info)
-                print("OBC:", obc_info)
-                print("Enabled add-ons: []")
-                print("=" * 65)
-                print(f"🛰️ PlutoSDR + Ground Station Active (Sat #{serial_number})")
-                print(f"📻 Radio Frequency  : {freq_mhz:.3f} MHz (Channel {channel})")
-                print(f"📋 Output Format    : {'Raw HEX Packets' if args.hex else 'Uptime, Lat, Lon'}")
-                print("=" * 65)
+                print(f"\n[Ground Link Active] Connected to satellite #{serial_number} via receiver hardware.", flush=True)
                 for sample in cube.telemetry.iter_samples(timeout=15):
                     if args.hex:
-                        # Raw HEX format
-                        print(f"1079{sample.device_uptime_ms:08X}...")
+                        print(f"1079{sample.device_uptime_ms:08X}...", flush=True)
                     else:
-                        print(f"{sample.device_uptime_ms} {sample.gps.latitude} {sample.gps.longitude}")
+                        print(f"{sample.device_uptime_ms} {sample.gps.latitude} {sample.gps.longitude}", flush=True)
         except Exception:
             pass
 
@@ -120,19 +110,19 @@ def main() -> None:
         receiver.start_direct_sdr()
         receiver.start_udp_listener(port=args.port)
     except Exception as exc:
-        print(f"\n[PlutoSDR Error] {exc}")
-        print(f"\nListening on UDP port {args.port} fallback...")
+        print(f"\n[PlutoSDR Error] {exc}", flush=True)
+        print(f"\nListening on UDP port {args.port} fallback...", flush=True)
         receiver.start_udp_listener(port=args.port)
 
-    print(f"\nStreaming live telemetry from Sat #{serial_number} via PlutoSDR (Ctrl+C to stop)...\n")
+    print(f"\nStreaming live telemetry from Sat #{serial_number} via PlutoSDR (Ctrl+C to stop)...\n", flush=True)
 
     try:
         while True:
             time.sleep(1)
     except KeyboardInterrupt:
-        print("\nStopping PlutoSDR receiver...")
+        print("\nStopping PlutoSDR receiver...", flush=True)
         receiver.stop()
-        print("Done.")
+        print("Done.", flush=True)
 
 
 if __name__ == "__main__":
