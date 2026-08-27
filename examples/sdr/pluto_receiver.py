@@ -89,34 +89,67 @@ def main() -> None:
         on_raw_hex=on_raw_hex,
     )
 
-    # 2. If serial receiver is available, initialize satellite link like sync.py
-    from rascube_v2.transport.serial import find_receivers
-    receivers = find_receivers()
-    if receivers:
-        try:
-            from rascube_v2.sync import RASCube as SyncCube
-            with SyncCube(receivers[0].device, serial_number=serial_number) as cube:
-                receiver_info = cube.receiver.get_info()
-                obc_info = cube.obc.get_info()
-                print("Receiver:", receiver_info, flush=True)
-                print("OBC:", obc_info, flush=True)
-                print("Enabled add-ons: []", flush=True)
-                for sample in cube.telemetry.iter_samples(timeout=15):
-                    if args.hex:
-                        print(f"1079{sample.device_uptime_ms:08X}...", flush=True)
-                    else:
-                        print(f"{sample.device_uptime_ms} {sample.gps.latitude} {sample.gps.longitude}", flush=True)
-        except Exception as exc:
-            pass
+    # Start embedded GNU Radio LoRa demodulator subprocess in background
+    gr_proc = None
+    try:
+        gr_cmd = [
+            "/opt/homebrew/opt/python@3.14/bin/python3.14",
+            "-c",
+            f"""
+import sys
+sys.path = [p for p in sys.path if not any(f'python3.{{v}}' in p for v in range(8, 20) if f'python3.{{v}}' != 'python3.14')]
+sys.path.insert(0, '/opt/homebrew/lib/python3.14/site-packages')
+import pmt, socket
+from gnuradio import gr, network
+from gnuradio.lora_sdr import lora_sdr_lora_rx
 
-    # 3. Connect directly to PlutoSDR hardware
+class FrameForwarder(gr.sync_block):
+    def __init__(self):
+        super().__init__(name='Forwarder', in_sig=None, out_sig=None)
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.message_port_register_in(pmt.intern('in'))
+        self.set_msg_handler(pmt.intern('in'), self.forward)
+
+    def forward(self, msg):
+        data = pmt.cdr(msg) if pmt.is_pair(msg) else msg
+        raw = bytes(pmt.u8vector_elements(data))
+        self.sock.sendto(raw, ('127.0.0.1', 9091))
+
+tb = gr.top_block('LoRaRX')
+src = network.udp_source(8, 1, 9090, 0, 1472, False, False, False)
+rx = lora_sdr_lora_rx(
+    center_freq={int(freq_mhz * 1e6)},
+    bw={int(args.bw)},
+    cr=1,
+    has_crc=True,
+    impl_head=False,
+    pay_len=121,
+    samp_rate=1000000,
+    sf={int(args.sf)},
+    sync_word=[0x34],
+    soft_decoding=True,
+    ldro_mode=0,
+    print_rx=[False, False],
+)
+fwd = FrameForwarder()
+tb.connect((src, 0), (rx, 0))
+tb.msg_connect((rx, 'out'), (fwd, 'in'))
+tb.run()
+""",
+        ]
+        import subprocess
+        gr_proc = subprocess.Popen(gr_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        time.sleep(0.3)
+    except Exception:
+        pass
+
+    # Connect directly to PlutoSDR hardware
     try:
         receiver.start_direct_sdr()
-        receiver.start_udp_listener(port=args.port)
+        receiver.start_udp_listener(port=9091)
     except Exception as exc:
         print(f"\n[PlutoSDR Error] {exc}", flush=True)
-        print(f"\nListening on UDP port {args.port} fallback...", flush=True)
-        receiver.start_udp_listener(port=args.port)
+        receiver.start_udp_listener(port=9091)
 
     print(f"\nStreaming live telemetry from Sat #{serial_number} via PlutoSDR (Ctrl+C to stop)...\n", flush=True)
 
@@ -125,6 +158,8 @@ def main() -> None:
             time.sleep(1)
     except KeyboardInterrupt:
         print("\nStopping PlutoSDR receiver...", flush=True)
+        if gr_proc:
+            gr_proc.terminate()
         receiver.stop()
         print("Done.", flush=True)
 
