@@ -33,8 +33,13 @@ LORA_WHITENING_NIBBLES: Final[list[int]] = [
     12, 5, 8, 11, 1, 6, 3, 12, 7, 9, 14, 2, 13, 5, 10, 11, 4, 6, 9, 12, 2, 9, 5, 2, 10, 5, 5, 11, 10, 6, 4, 12,
     9, 9, 2, 2, 5, 5, 10, 10, 5, 4, 10, 9, 4, 2, 9, 5, 3, 10, 6, 4, 12, 9, 8, 3, 0, 6, 0, 12, 1, 9, 2, 2,
     4, 5, 8, 10, 1, 5, 3, 10, 6, 5, 12, 11, 8, 6, 0, 13, 1, 10, 3, 5, 7, 10, 14, 4, 12, 9, 9, 2, 3, 5, 6, 10,
-    13, 5, 10, 10, 4, 5, 9, 10, 2, 5, 5, 10, 11, 5, 6, 10, 13, 5, 10, 11, 4, 6, 8, 12, 1, 9, 3, 3, 6, 6, 12, 12
 ]
+
+LORA_WHITENING_BYTES: Final[list[int]] = [
+    (LORA_WHITENING_NIBBLES[i * 2] << 4) | LORA_WHITENING_NIBBLES[i * 2 + 1]
+    for i in range(len(LORA_WHITENING_NIBBLES) // 2)
+]
+LORA_WHITENING_SEQUENCE: Final[list[int]] = LORA_WHITENING_BYTES
 
 
 class SoftwareLoRaDSP:

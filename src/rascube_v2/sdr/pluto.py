@@ -252,6 +252,12 @@ def generate_lora_tx_waveform(
 ) -> np.ndarray:
     """Generates standard-compliant LoRa IQ samples using GNU Radio DSP blocks with software fallback."""
     try:
+        import sys
+        for ver in ["3.14", "3.13", "3.12"]:
+            p = f"/opt/homebrew/lib/python{ver}/site-packages"
+            if os.path.exists(p) and p not in sys.path:
+                sys.path.insert(0, p)
+
         import pmt
         from gnuradio import blocks, gr
         from gnuradio.lora_sdr import lora_sdr_python as lora_sdr
@@ -292,7 +298,8 @@ def generate_lora_tx_waveform(
         from rascube_v2.sdr.lora_dsp import SoftwareLoRaDSP
 
         dsp = SoftwareLoRaDSP(spreading_factor=sf, bandwidth_hz=bw, sample_rate=samp_rate)
-        return dsp.modulate_bytes(payload)
+        iq_raw = dsp.modulate_bytes(payload)
+        return (iq_raw * 30000.0).astype(np.complex64)
 
 
 class PlutoSDRTransmitter:
