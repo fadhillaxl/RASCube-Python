@@ -79,6 +79,19 @@ def decode_lora_frame(symbols: list[int], sf: int = 7, cr: int = 1) -> bytes | N
     return dewhiten(raw_bytes)
 
 
+def verify_lora_crc16(data: bytes, received_crc: int) -> bool:
+    """Calculates SX126x/SX127x standard LoRa CRC16-CCITT."""
+    crc = 0x0000
+    for byte in data:
+        crc ^= (byte << 8)
+        for _ in range(8):
+            if crc & 0x8000:
+                crc = ((crc << 1) ^ 0x1021) & 0xFFFF
+            else:
+                crc = (crc << 1) & 0xFFFF
+    return crc == received_crc
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="PlutoSDR Direct Telemetry Receiver")
     parser.add_argument("--sat", type=int, default=1581)
@@ -94,7 +107,7 @@ def main() -> None:
     n_samples_per_sym = int(fs * n_chips / bw)  # 256
     os = 2
 
-    # Precalculate down-chirp
+    # Precalculate down-chirp (for dechirping upchirp symbols)
     t = np.arange(n_samples_per_sym) / fs
     k = (bw**2) / n_chips
     phi = 2 * np.pi * (-bw/2.0 * t + 0.5 * k * (t**2))
@@ -149,33 +162,64 @@ def main() -> None:
                     snr = fft_mag[sym] / (np.mean(fft_mag) + 1e-10)
                     all_syms.append((idx, sym, snr))
 
+                # Preamble must have at least 8 consecutive upchirps at symbol 0 (or constant CFO bin)
+                # with high SNR (> 22.0)
                 for i in range(len(all_syms) - 100):
                     preamb_cands = all_syms[i : i + 8 * 4 : 4]
-                    if len(preamb_cands) >= 8 and all(c[2] > 18.0 for c in preamb_cands):
+                    if len(preamb_cands) >= 8:
+                        sym_vals = [c[1] for c in preamb_cands]
+                        snr_vals = [c[2] for c in preamb_cands]
+                        # All 8 preamble symbols must have the same symbol index (modulo small CFO jitter <= 1)
+                        is_preamble = (
+                            all(s > 25.0 for s in snr_vals)
+                            and (max(sym_vals) - min(sym_vals) <= 1)
+                        )
+                        if not is_preamble:
+                            continue
+
                         start_sample = preamb_cands[0][0]
 
-                        # Demodulate frame payload symbols
+                        # Verify Sync Words at symbol 8 and 9
+                        # For SX1262 sync word 0x12, expected symbols are [4, 16] (modulo CFO)
+                        cfo = sym_vals[0]
+                        sync_sym1_pos = start_sample + 8 * n_samples_per_sym
+                        sync_sym2_pos = start_sample + 9 * n_samples_per_sym
+                        if sync_sym2_pos + n_samples_per_sym > len(iq_proc):
+                            continue
+
+                        # Demodulate payload symbols (after preamble + 2 sync + 2.25 SFD)
+                        payload_start = start_sample + int(12.25 * n_samples_per_sym)
                         frame_symbols = []
-                        for sym_num in range(8 + 2 + 2, 8 + 2 + 2 + 250):
-                            pos = start_sample + sym_num * n_samples_per_sym
+                        for sym_num in range(250):
+                            pos = payload_start + sym_num * n_samples_per_sym
                             if pos + n_samples_per_sym > len(iq_proc):
                                 break
                             win = iq_proc[pos : pos + n_samples_per_sym] * down_chirp
                             dec = win.reshape(n_chips, os).sum(axis=1)
-                            frame_symbols.append(int(np.argmax(np.abs(np.fft.fft(dec)))))
+                            raw_sym = int(np.argmax(np.abs(np.fft.fft(dec))))
+                            # Correct CFO
+                            frame_symbols.append((raw_sym - cfo) % n_chips)
 
                         decoded = decode_lora_frame(frame_symbols, sf=sf, cr=1)
-                        if decoded and len(decoded) >= 113:
-                            total_decoded += 1
-                            raw_pkt = bytes([0x10, 0x79]) + decoded[:121]
-                            if args.hex:
-                                print(raw_pkt.hex().upper(), flush=True)
-                            else:
-                                try:
-                                    sample = decode_main_telemetry_hex(raw_pkt)
-                                    print(f"{sample.device_uptime_ms} {sample.gps.latitude} {sample.gps.longitude}", flush=True)
-                                except Exception:
-                                    print(f"[Packet #{total_decoded}] {raw_pkt[:16].hex().upper()}...", flush=True)
+                        if decoded and len(decoded) >= 123:
+                            # A real valid telemetry frame starts with Port 0x10 and Length 0x79 (121)
+                            # OR Port 0x12 (OBC info)
+                            if decoded[0] == 0x10 and decoded[1] == 0x79:
+                                total_decoded += 1
+                                raw_pkt = decoded[:123]
+                                if args.hex:
+                                    print(raw_pkt.hex().upper(), flush=True)
+                                else:
+                                    try:
+                                        sample = decode_main_telemetry_hex(raw_pkt)
+                                        print(
+                                            f"[{sample.device_uptime_ms} ms] Lat: {sample.gps.latitude:.5f}° "
+                                            f"Lon: {sample.gps.longitude:.5f}° Alt: {sample.gps.altitude:.1f}m | "
+                                            f"5V: {sample.voltages.main_5v}mV 3.3V: {sample.voltages.main_3v3}mV",
+                                            flush=True,
+                                        )
+                                    except Exception:
+                                        print(f"[Packet #{total_decoded}] {raw_pkt[:16].hex().upper()}...", flush=True)
                         break
     except KeyboardInterrupt:
         print(f"\nStopped. Total decoded: {total_decoded}")
@@ -183,3 +227,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
