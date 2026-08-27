@@ -3,6 +3,7 @@ from __future__ import annotations
 import dataclasses
 import math
 import socket
+import struct
 import threading
 import time
 from collections.abc import Callable, Iterator
