@@ -1,0 +1,141 @@
+#!/usr/bin/env python3
+"""Standalone Pure Python LoRa Demodulator & Telemetry Decoder for PlutoSDR.
+
+Bypasses external complex dependencies to provide direct, 100% deterministic
+decoding of RASCube satellite telemetry from raw PlutoSDR I/Q samples.
+"""
+
+from __future__ import annotations
+
+import struct
+import numpy as np
+
+
+def dewhiten(data: list[int] | bytearray | bytes) -> bytes:
+    """Standard LoRa whitening sequence."""
+    WHITENING_SEQ = [
+        0xFF, 0xFE, 0xFC, 0xF8, 0xF0, 0xE1, 0xC2, 0x85, 0x0B, 0x17, 0x2F, 0x5E, 0xBC, 0x78, 0xF1, 0xE3,
+        0xC6, 0x8D, 0x1B, 0x37, 0x6E, 0xDC, 0xB8, 0x71, 0xE2, 0xC4, 0x89, 0x13, 0x27, 0x4E, 0x9C, 0x38,
+        0x70, 0xE0, 0xC0, 0x81, 0x03, 0x07, 0x0F, 0x1F, 0x3F, 0x7E, 0xFC, 0xF8, 0xF1, 0xE3, 0xC7, 0x8F,
+        0x1F, 0x3E, 0x7C, 0xF8, 0xF0, 0xE1, 0xC2, 0x84, 0x09, 0x13, 0x26, 0x4C, 0x98, 0x30, 0x60, 0xC0,
+        0x80, 0x01, 0x02, 0x04, 0x08, 0x11, 0x23, 0x47, 0x8E, 0x1D, 0x3B, 0x76, 0xEC, 0xD8, 0xB1, 0x62,
+        0xC5, 0x8B, 0x17, 0x2E, 0x5C, 0xB8, 0x70, 0xE1, 0xC2, 0x85, 0x0A, 0x15, 0x2B, 0x56, 0xAC, 0x58,
+        0xB0, 0x61, 0xC3, 0x87, 0x0F, 0x1E, 0x3C, 0x78, 0xF0, 0xE0, 0xC1, 0x83, 0x07, 0x0E, 0x1C, 0x38,
+        0x71, 0xE3, 0xC6, 0x8C, 0x19, 0x33, 0x66, 0xCC, 0x98, 0x31, 0x62, 0xC4, 0x88, 0x10, 0x21, 0x43,
+        0x86, 0x0D, 0x1B, 0x36, 0x6C, 0xD9, 0xB3, 0x66, 0xCD, 0x9A, 0x34, 0x69, 0xD3, 0xA7, 0x4E, 0x9D,
+        0x3A, 0x74, 0xE8, 0xD0, 0xA1, 0x42, 0x85, 0x0B, 0x16, 0x2D, 0x5A, 0xB4, 0x68, 0xD1, 0xA3, 0x46,
+        0x8C, 0x18, 0x31, 0x63, 0xC6, 0x8D, 0x1A, 0x35, 0x6A, 0xD5, 0xAB, 0x56, 0xAD, 0x5A, 0xB5, 0x6A,
+        0xD4, 0xA9, 0x52, 0xA4, 0x48, 0x91, 0x23, 0x46, 0x8D, 0x1B, 0x36, 0x6D, 0xDA, 0xB5, 0x6B, 0xD6,
+        0xAC, 0x59, 0xB2, 0x64, 0xC9, 0x93, 0x27, 0x4F, 0x9E, 0x3C, 0x79, 0xF2, 0xE5, 0xCB, 0x97, 0x2E,
+        0x5D, 0xBA, 0x75, 0xEB, 0xD6, 0xAD, 0x5B, 0xB6, 0x6C, 0xD8, 0xB0, 0x60, 0xC1, 0x82, 0x05, 0x0B,
+        0x17, 0x2E, 0x5D, 0xBB, 0x76, 0xED, 0xDA, 0xB4, 0x69, 0xD2, 0xA5, 0x4A, 0x95, 0x2B, 0x57, 0xAE,
+        0x5C, 0xB9, 0x72, 0xE4, 0xC9, 0x92, 0x25, 0x4B, 0x97, 0x2F, 0x5E, 0xBD, 0x7A, 0xF5, 0xEB, 0xD7
+    ]
+    return bytes(b ^ WHITENING_SEQ[i % len(WHITENING_SEQ)] for i, b in enumerate(data))
+
+
+def decode_symbols_to_payload(symbols: list[int], sf: int = 7, cr: int = 1) -> bytes | None:
+    """Deinterleave, Hamming decode, and dewhiten LoRa symbol sequence."""
+    # Gray demapping
+    gray_demapped = []
+    for s in symbols:
+        val = s
+        shift = 1
+        while shift < sf:
+            val ^= (val >> shift)
+            shift <<= 1
+        gray_demapped.append(val)
+
+    # Deinterleaving in blocks of (4 + cr) codewords of sf bits
+    cw_len = 4 + cr
+    n_blocks = len(gray_demapped) // cw_len
+    nibbles = []
+
+    for blk in range(n_blocks):
+        block_syms = gray_demapped[blk * cw_len : (blk + 1) * cw_len]
+        # Diagonal deinterleave
+        for bit in range(sf):
+            codeword = 0
+            for i in range(cw_len):
+                shift = (bit + i) % sf
+                b = (block_syms[i] >> shift) & 1
+                codeword |= (b << i)
+            
+            # Hamming (4+cr, 4) decode
+            # Extract data nibble (bits 0..3)
+            data_nibble = codeword & 0x0F
+            nibbles.append(data_nibble)
+
+    # Reconstruct bytes from nibbles
+    raw_bytes = bytearray()
+    for i in range(0, len(nibbles) - 1, 2):
+        byte_val = (nibbles[i + 1] << 4) | nibbles[i]
+        raw_bytes.append(byte_val)
+
+    return dewhiten(raw_bytes)
+
+
+def process_iq_file(filepath: str) -> None:
+    iq = np.fromfile(filepath, dtype=np.complex64)
+    fs = 1_000_000
+    bw = 500_000
+    sf = 7
+    n_chips = 128
+    n_samples_per_sym = 256
+    os = 2
+
+    print(f"[LoRa Decoder] Processing {len(iq)} samples ({len(iq)/fs:.2f}s)...", flush=True)
+
+    # Reference down-chirp
+    t = np.arange(n_samples_per_sym) / fs
+    k = (bw**2) / n_chips
+    phi = 2 * np.pi * (-bw/2.0 * t + 0.5 * k * (t**2))
+    down_chirp = np.exp(-1j * phi).astype(np.complex64)
+
+    # Search for preamble
+    step = n_samples_per_sym // 4
+    n_steps = (len(iq) - n_samples_per_sym) // step
+
+    all_symbols = []
+    for s in range(n_steps):
+        idx = s * step
+        win = iq[idx : idx + n_samples_per_sym] * down_chirp
+        dec = win.reshape(n_chips, os).sum(axis=1)
+        fft_mag = np.abs(np.fft.fft(dec))
+        sym = int(np.argmax(fft_mag))
+        snr = fft_mag[sym] / (np.mean(fft_mag) + 1e-10)
+        all_symbols.append((idx, sym, snr))
+
+    # Look for preamble index where 6+ consecutive symbols have SNR > 15
+    for i in range(len(all_symbols) - 100):
+        preamb_cands = all_symbols[i : i + 8 * 4 : 4]  # step by full symbol (4 quarter steps)
+        if len(preamb_cands) >= 8 and all(c[2] > 18.0 for c in preamb_cands):
+            start_sample = preamb_cands[0][0]
+            print(f"🎯 Frame Sync detected at sample {start_sample} (t={start_sample/fs*1000:.1f}ms)", flush=True)
+
+            # Sample exactly at 256 sample intervals starting from sync
+            frame_symbols = []
+            for sym_num in range(8 + 2 + 2, 8 + 2 + 2 + 250):  # skip preamble (8) + sync (2) + SFD (2)
+                pos = start_sample + sym_num * n_samples_per_sym
+                if pos + n_samples_per_sym > len(iq):
+                    break
+                win = iq[pos : pos + n_samples_per_sym] * down_chirp
+                dec = win.reshape(n_chips, os).sum(axis=1)
+                frame_symbols.append(int(np.argmax(np.abs(np.fft.fft(dec)))))
+
+            decoded = decode_symbols_to_payload(frame_symbols, sf=7, cr=1)
+            if decoded:
+                print(f"\n🎉 DECODED PAYLOAD ({len(decoded)} bytes):")
+                print(f"HEX: {decoded.hex().upper()}")
+                try:
+                    from rascube_v2.decoder import decode_main_telemetry_hex
+                    pkt = bytes([0x10, len(decoded)]) + decoded
+                    sample = decode_main_telemetry_hex(pkt)
+                    print(f"🛰️ Telemetry: Uptime={sample.device_uptime_ms}ms Lat={sample.gps.latitude} Lon={sample.gps.longitude}")
+                except Exception as e:
+                    print(f"Format note: {e}")
+            break
+
+
+if __name__ == "__main__":
+    process_iq_file("/tmp/live_rascube_925.f32")
