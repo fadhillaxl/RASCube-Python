@@ -103,12 +103,58 @@ def verify_lora_crc16(data: bytes, received_crc: int) -> bool:
     return crc == received_crc
 
 
+def format_telemetry_summary(sample: MainTelemetrySample, meas_rssi: float, meas_snr: float, count: int) -> str:
+    """Formats decoded MainTelemetrySample into human-readable ground station log."""
+    return (
+        f"[{count}] Seq #{sample.packet_sequence} | "
+        f"Uptime: {sample.device_uptime_ms / 1000.0:.1f}s | "
+        f"Vbat: {sample.eps.battery_charge.bus_voltage_v:.2f}V | "
+        f"Temp: {sample.barometer.temperature_c:.1f}°C | "
+        f"Alt: {sample.barometer.altitude_m:.1f}m | "
+        f"GPS: ({sample.gps.latitude:.4f}°, {sample.gps.longitude:.4f}°, {sample.gps.satellites} sats) | "
+        f"RSSI: {meas_rssi:.1f}dBm | SNR: {meas_snr:.1f}dB"
+    )
+
+
+def print_decoded_hex(hex_str: str) -> None:
+    """Decodes and prints complete telemetry structure from HEX."""
+    import json
+    from rascube_v2 import decode_telemetry_to_dict
+
+    print("=" * 65)
+    print("🛰️ PlutoSDR Telemetry HEX Decoder")
+    print("=" * 65)
+    print(f"Raw HEX ({len(hex_str)//2} bytes):\n{hex_str}\n")
+
+    sample = decode_main_telemetry_hex(hex_str)
+    print("--- 📡 Decoded Satellite Metrics ---")
+    print(f"Sequence Counter  : #{sample.packet_sequence}")
+    print(f"System Uptime     : {sample.device_uptime_ms / 1000.0:.2f} s")
+    print(f"Battery Voltage   : {sample.eps.battery_charge.bus_voltage_v:.3f} V")
+    print(f"5V Rail Voltage   : {sample.eps.main_5v_v:.3f} V")
+    print(f"3.3V Rail Voltage : {sample.eps.main_3v3_v:.3f} V")
+    print(f"Barometer Temp    : {sample.barometer.temperature_c:.1f} °C")
+    print(f"Barometer Altitude: {sample.barometer.altitude_m:.2f} m")
+    print(f"Barometer Pressure: {sample.barometer.pressure_hpa:.2f} hPa")
+    print(f"IMU Accel (g)     : X={sample.imu.accelerometer_g.x:.3f}, Y={sample.imu.accelerometer_g.y:.3f}, Z={sample.imu.accelerometer_g.z:.3f}")
+    print(f"IMU Gyro (°/s)    : X={sample.imu.gyroscope_dps.x:.2f}, Y={sample.imu.gyroscope_dps.y:.2f}, Z={sample.imu.gyroscope_dps.z:.2f}")
+    print(f"GPS Position      : Lat={sample.gps.latitude:.6f}°, Lon={sample.gps.longitude:.6f}°, Alt={sample.gps.altitude_m:.1f} m, Sats={sample.gps.satellites}")
+    print(f"Radio Link        : RSSI={sample.receiver_rssi:.1f} dBm, SNR={sample.receiver_snr:.2f} dB")
+    print("=" * 65)
+
+
 def main() -> None:
-    parser = argparse.ArgumentParser(description="PlutoSDR Direct Telemetry Receiver")
-    parser.add_argument("--sat", type=int, default=1581)
-    parser.add_argument("--gain", type=float, default=40.0)
-    parser.add_argument("--hex", action="store_true")
+    parser = argparse.ArgumentParser(description="PlutoSDR Direct Telemetry Receiver & HEX Decoder")
+    parser.add_argument("--sat", type=int, default=1581, help="Satellite serial number (default: 1581)")
+    parser.add_argument("--gain", type=float, default=40.0, help="SDR RX gain in dB (default: 40.0)")
+    parser.add_argument("--hex", action="store_true", help="Print raw HEX telemetry packets instead of metrics")
+    parser.add_argument("--json", action="store_true", help="Print decoded packets in JSON format")
+    parser.add_argument("--decode", type=str, default=None, help="Decode a specific raw HEX packet and exit")
     args = parser.parse_args()
+
+    if args.decode:
+        print_decoded_hex(args.decode)
+        return
 
     freq_hz = 916_000_000 + (args.sat % 18) * 600_000
     fs = 1_000_000
@@ -138,6 +184,7 @@ def main() -> None:
     print(f"🛰️ PlutoSDR Native Real-Time Ground Station Receiver")
     print(f"📡 Sat #{args.sat} @ {freq_hz/1e6:.3f} MHz (Channel {args.sat % 18})")
     print(f"⚙️ LoRa Modulation: SF={sf}, BW={bw/1000:.0f} kHz, CR=4/5")
+    print(f"📋 Output Mode    : {'Raw HEX Stream' if args.hex else 'Live Decoded Telemetry'}")
     print("=" * 65)
     print("Streaming live telemetry directly from SDR (Ctrl+C to stop)...\n")
 
@@ -148,16 +195,17 @@ def main() -> None:
     try:
         while True:
             raw_buf = dev.rx()
-            if raw_buf is None:
+            if raw_buf is None or len(raw_buf) == 0:
+                time.sleep(0.005)
                 continue
 
-            iq = (raw_buf / 2048.0).astype(np.complex64)
-            buf_accum = np.concatenate([buf_accum, iq])
+            c64_buf = (raw_buf.astype(np.complex64) / 2048.0)
+            buf_accum = np.concatenate((buf_accum, c64_buf))
 
-            # Process when we have > 1.0s of data
-            if len(buf_accum) >= 1_000_000:
-                iq_proc = buf_accum[:1_000_000]
-                buf_accum = buf_accum[750_000:]  # 250ms overlap
+            # Process in windows of 200,000 samples (~0.2s)
+            if len(buf_accum) >= 200_000:
+                iq_proc = buf_accum[:200_000]
+                buf_accum = buf_accum[180_000:]
 
                 # Search for LoRa preambles
                 step = n_samples_per_sym // 4
@@ -213,10 +261,18 @@ def main() -> None:
 
                             if args.hex:
                                 print(rascube_pkt.hex().upper(), flush=True)
+                            elif args.json:
+                                import json
+                                from rascube_v2 import decode_telemetry_to_dict
+                                try:
+                                    d = decode_telemetry_to_dict(rascube_pkt)
+                                    print(json.dumps(d), flush=True)
+                                except Exception:
+                                    print(f"[{total_decoded}] {rascube_pkt.hex().upper()}", flush=True)
                             else:
                                 try:
                                     sample = decode_main_telemetry_hex(rascube_pkt)
-                                    print(f"[{total_decoded}] Uptime: {sample.device_uptime_ms}ms | Bat: {sample.voltage_cell_1_mv}mV | RSSI: {sample.radio.rssi_dbm:.1f}dBm | SNR: {sample.radio.snr_db:.1f}dB", flush=True)
+                                    print(format_telemetry_summary(sample, meas_rssi, meas_snr, total_decoded), flush=True)
                                 except Exception:
                                     print(f"[{total_decoded}] {rascube_pkt.hex().upper()}", flush=True)
 
@@ -230,5 +286,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
-
