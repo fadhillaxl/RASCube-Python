@@ -129,32 +129,32 @@ class PlutoSDRReceiver:
         self._thread.start()
 
     def _sdr_rx_worker(self) -> None:
-        """Continuously reads raw I/Q samples from Pluto+ SDR and demodulates LoRa packets."""
+        """Continuous background thread reading Pluto+ SDR raw I/Q samples."""
         while self._running and self._sdr_device is not None:
             try:
-                # Read I/Q buffer from Pluto+ SDR hardware
                 iq_data = self._sdr_device.rx()
                 if iq_data is None or len(iq_data) == 0:
                     time.sleep(0.01)
                     continue
 
-                # Run DSP demodulation on I/Q samples
-                packets = self._dsp.demodulate_samples(iq_data)
-                for pkt in packets:
-                    self.total_packets_received += 1
-                    hex_str = pkt.hex().upper()
-                    if self.on_raw_hex:
-                        self.on_raw_hex(hex_str)
-                    if self.on_sample:
-                        try:
-                            sample = decode_main_telemetry_hex(pkt)
-                            self.on_sample(sample)
-                        except Exception:
-                            pass
-
-            except Exception as exc:
+                if self._dsp is not None:
+                    packets = self._dsp.demodulate_samples(iq_data)
+                    for pkt in packets:
+                        self.total_packets_received += 1
+                        hex_str = pkt.hex().upper()
+                        if self.on_raw_hex:
+                            self.on_raw_hex(hex_str)
+                        if self.on_sample:
+                            try:
+                                sample = decode_main_telemetry_hex(pkt)
+                                self.on_sample(sample)
+                            except Exception:
+                                pass
+            except Exception:
                 if self._running:
                     time.sleep(0.05)
+                else:
+                    break
 
     def transmit_packet(self, payload: bytes) -> None:
         """Modulates and transmits a LoRa packet via Pluto+ SDR TX antenna."""
