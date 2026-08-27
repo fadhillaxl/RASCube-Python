@@ -123,7 +123,7 @@ class FrameForwarder(gr.sync_block):
             print(f'[GR] Forward error: {{exc}}', flush=True)
 
 tb = gr.top_block('LoRaRX')
-src = network.udp_source(8, "127.0.0.1", 9090, 8*1024*1024, 1472, False, False, False)
+src = network.udp_source(8, 1, 9090, 0, 1472, False, False, False)
 rx = lora_sdr_lora_rx(
     center_freq={freq_hz},
     bw={args.bw},
