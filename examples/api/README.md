@@ -20,6 +20,9 @@ This tutorial explains how to run, test, and integrate the **RASCubeV2 Ground St
    - [7. Realtime Live Stream (SSE)](#7-realtime-live-stream-sse)
    - [8. Ingest Telemetry from Client Web Serial](#8-ingest-telemetry-from-client-web-serial)
    - [9. Decode Raw HEX Telemetry](#9-decode-raw-hex-telemetry)
+   - [10. Trigger Camera Capture](#10-trigger-camera-capture)
+   - [11. Get Camera Capture Status](#11-get-camera-capture-status)
+   - [12. Get Latest Camera Image](#12-get-latest-camera-image)
 6. [Client Web Serial Guide (Connecting USB from User Browser)](#client-web-serial-guide-connecting-usb-from-user-browser)
 7. [Frontend Integration Guide (React / Vite / JavaScript)](#frontend-integration-guide-react--vite--javascript)
 8. [Troubleshooting & FAQs](#troubleshooting--faqs)
@@ -30,6 +33,7 @@ This tutorial explains how to run, test, and integrate the **RASCubeV2 Ground St
 
 - 🔌 **Zero External Web Dependencies**: Uses Python's built-in `http.server` and threading. No extra frameworks required.
 - 💻 **Client Web Serial (Browser USB)**: Direct USB receiver reading via Chrome/Edge Web Serial API, with automatic ingestion to the backend.
+- 📸 **Satellite Camera Capture**: Trigger photos from the satellite, track progressive block assembly, and fetch JPEGs via REST.
 - 📖 **Interactive Swagger UI**: Full OpenAPI 3.0 documentation available at `/docs`.
 - ⚡ **Realtime Streaming (SSE)**: Native Server-Sent Events stream for instant updates in frontend dashboards without polling overhead.
 - 🌐 **Cross-Origin Enabled (CORS)**: Pre-configured CORS headers allow any React/Vite/Vue frontend to communicate seamlessly.
@@ -357,6 +361,88 @@ Decodes any 121-byte raw telemetry payload or 123-byte (`10 79...`) frame string
   curl -X POST http://localhost:8080/api/decode \
        -H "Content-Type: application/json" \
        -d '{"hex": "10796C3100008E13EC0C..."}'
+  ```
+
+---
+
+### 10. Trigger Camera Capture
+
+Sends a command to the satellite to capture a photo and starts receiving progressive JPEG blocks.
+
+- **Method**: `POST`
+- **URL**: `/api/camera/capture`
+- **Headers**: `Content-Type: application/json`
+- **Body** (optional):
+  ```json
+  {
+    "timeout": 35.0
+  }
+  ```
+- **Example cURL**:
+  ```bash
+  curl -X POST http://localhost:8080/api/camera/capture \
+       -H "Content-Type: application/json" \
+       -d '{"timeout": 35.0}'
+  ```
+- **Example Response (202 Accepted)**:
+  ```json
+  {
+    "status": "capturing",
+    "message": "Camera capture initiated with 35.0s timeout",
+    "check_status_url": "/api/camera/status"
+  }
+  ```
+
+---
+
+### 11. Get Camera Capture Status
+
+Polls the status of the current or most recent camera capture session.
+
+- **Method**: `GET`
+- **URL**: `/api/camera/status`
+- **Example cURL**:
+  ```bash
+  curl -s http://localhost:8080/api/camera/status
+  ```
+- **Example Response (200 OK)**:
+  ```json
+  {
+    "status": "completed",
+    "progress": {
+      "blocks_received": 36,
+      "total_bytes": 9216,
+      "started_at": 1787579100.12,
+      "elapsed_seconds": 9.4,
+      "error": null
+    },
+    "has_image": true,
+    "metadata": {
+      "block_count": 36,
+      "duplicate_blocks": 0,
+      "byte_length": 9216,
+      "captured_at": 1787579109.52,
+      "capture_duration_seconds": 9.4
+    },
+    "image_url": "/api/camera/latest.jpg"
+  }
+  ```
+
+---
+
+### 12. Get Latest Camera Image
+
+Retrieves the most recently captured satellite photo.
+
+- **JSON & Base64**: `GET /api/camera/latest`
+- **Raw Binary JPEG Image**: `GET /api/camera/latest.jpg` (or `GET /api/camera/image`)
+- **Direct Embed in HTML**:
+  ```html
+  <img src="http://localhost:8080/api/camera/latest.jpg" alt="Satellite Capture" />
+  ```
+- **Example cURL (Download image to file)**:
+  ```bash
+  curl -o satellite_photo.jpg http://localhost:8080/api/camera/latest.jpg
   ```
 
 ---

@@ -13,6 +13,7 @@ Features:
 from __future__ import annotations
 
 import argparse
+import base64
 import collections
 import dataclasses
 import json
@@ -28,7 +29,12 @@ from serial.tools import list_ports
 
 from rascube_v2 import SyncRASCube, decode_telemetry_to_dict
 from rascube_v2.constants import USB_PID_V2, USB_VID
-from rascube_v2.exceptions import ProtocolDecodeError
+from rascube_v2.exceptions import (
+    CameraAssemblyError,
+    ProtocolDecodeError,
+    RequestTimeoutError,
+    SessionBusyError,
+)
 
 # --- Global State ---
 class GroundStationState:
@@ -47,6 +53,20 @@ class GroundStationState:
         self.history: collections.deque[dict[str, Any]] = collections.deque(maxlen=200)
         self.total_samples_received: int = 0
         self.last_received_time: float | None = None
+
+        # Camera storage & state
+        self.camera_status: str = "idle"  # "idle", "capturing", "completed", "failed"
+        self.camera_progress: dict[str, Any] = {
+            "blocks_received": 0,
+            "total_bytes": 0,
+            "started_at": None,
+            "elapsed_seconds": 0.0,
+            "error": None,
+        }
+        self.latest_image: bytes | None = None
+        self.latest_image_metadata: dict[str, Any] | None = None
+        self.camera_lock = threading.Lock()
+        self.camera_thread: threading.Thread | None = None
 
         # SSE Subscribers
         self.subscribers: list[queue.Queue[dict[str, Any]]] = []
@@ -133,13 +153,63 @@ def background_telemetry_loop(port: str, serial_number: int) -> None:
         print(f"[API Backend] Disconnected from {port}")
 
 
+def trigger_camera_capture(timeout: float = 30.0) -> None:
+    """Initiates a background thread to capture JPEG camera image from satellite."""
+    global state
+    with state.camera_lock:
+        if state.camera_status == "capturing":
+            raise SessionBusyError("A camera capture session is already in progress")
+        if not state.is_connected or state.cube is None:
+            raise ConnectionError("Receiver is not connected to a satellite. Connect first via /api/connect")
+
+        state.camera_status = "capturing"
+        state.camera_progress = {
+            "blocks_received": 0,
+            "total_bytes": 0,
+            "started_at": time.time(),
+            "elapsed_seconds": 0.0,
+            "error": None,
+        }
+
+    def _worker() -> None:
+        start_time = time.time()
+        try:
+            def on_block(block: Any) -> None:
+                with state.lock:
+                    state.camera_progress["blocks_received"] += 1
+                    state.camera_progress["total_bytes"] += len(block.data)
+                    state.camera_progress["elapsed_seconds"] = round(time.time() - start_time, 2)
+
+            image = state.cube.camera.capture(timeout=timeout, on_block=on_block)
+            with state.lock:
+                state.latest_image = image.jpeg
+                state.latest_image_metadata = {
+                    "block_count": image.block_count,
+                    "duplicate_blocks": image.duplicate_blocks,
+                    "byte_length": len(image.jpeg),
+                    "captured_at": time.time(),
+                    "capture_duration_seconds": round(time.time() - start_time, 2),
+                }
+                state.camera_status = "completed"
+            print(f"[API Backend] Camera capture completed: {len(image.jpeg)} bytes in {time.time() - start_time:.2f}s")
+        except Exception as exc:
+            print(f"[API Backend] Camera capture error: {exc}")
+            with state.lock:
+                state.camera_status = "failed"
+                state.camera_progress["error"] = str(exc)
+
+    t = threading.Thread(target=_worker, daemon=True, name="camera-worker")
+    state.camera_thread = t
+    t.start()
+
+
 # OpenAPI 3.0 Specification
 OPENAPI_SCHEMA: dict[str, Any] = {
     "openapi": "3.0.3",
     "info": {
         "title": "RASCubeV2 Ground Station & Telemetry API",
-        "description": "REST API and Realtime Streaming API for RASCubeV2 Satellite USB Receiver and Telemetry",
-        "version": "1.0.0",
+        "description": "REST API and Realtime Streaming API for RASCubeV2 Satellite USB Receiver, Telemetry & Camera Capture",
+        "version": "1.1.0",
         "contact": {
             "name": "RASCube Ground Station Team",
         },
@@ -150,6 +220,7 @@ OPENAPI_SCHEMA: dict[str, Any] = {
     "tags": [
         {"name": "Connection", "description": "Serial Port & Satellite Connection Management"},
         {"name": "Telemetry", "description": "Real-time Telemetry, History & HEX Decoding"},
+        {"name": "Camera", "description": "Satellite Camera Capture & Image Preview"},
     ],
     "paths": {
         "/api/ports": {
@@ -444,6 +515,110 @@ OPENAPI_SCHEMA: dict[str, Any] = {
                 },
             },
         },
+        "/api/camera/capture": {
+            "post": {
+                "tags": ["Camera"],
+                "summary": "Trigger Camera Capture",
+                "description": "Sends command to satellite to capture a JPEG image with progressive block transfer.",
+                "requestBody": {
+                    "required": False,
+                    "content": {
+                        "application/json": {
+                            "schema": {
+                                "type": "object",
+                                "properties": {
+                                    "timeout": {
+                                        "type": "number",
+                                        "description": "Capture timeout in seconds",
+                                        "example": 35.0,
+                                        "default": 30.0,
+                                    }
+                                },
+                            }
+                        }
+                    },
+                },
+                "responses": {
+                    "202": {
+                        "description": "Camera capture initiated",
+                        "content": {
+                            "application/json": {
+                                "example": {
+                                    "status": "capturing",
+                                    "message": "Camera capture initiated with 35.0s timeout",
+                                    "check_status_url": "/api/camera/status",
+                                }
+                            }
+                        },
+                    },
+                    "409": {"description": "Capture already in progress"},
+                    "503": {"description": "Satellite not connected"},
+                },
+            }
+        },
+        "/api/camera/status": {
+            "get": {
+                "tags": ["Camera"],
+                "summary": "Get Camera Capture Status & Progress",
+                "description": "Returns current camera session status ('idle', 'capturing', 'completed', 'failed') and received block metrics.",
+                "responses": {
+                    "200": {
+                        "description": "Camera capture progress status",
+                        "content": {
+                            "application/json": {
+                                "example": {
+                                    "status": "completed",
+                                    "progress": {
+                                        "blocks_received": 32,
+                                        "total_bytes": 8192,
+                                        "started_at": 1787579100.0,
+                                        "elapsed_seconds": 8.4,
+                                        "error": None,
+                                    },
+                                    "has_image": True,
+                                    "metadata": {
+                                        "block_count": 32,
+                                        "duplicate_blocks": 0,
+                                        "byte_length": 8192,
+                                        "captured_at": 1787579108.4,
+                                        "capture_duration_seconds": 8.4,
+                                    },
+                                    "image_url": "/api/camera/latest.jpg",
+                                }
+                            }
+                        },
+                    }
+                },
+            }
+        },
+        "/api/camera/latest": {
+            "get": {
+                "tags": ["Camera"],
+                "summary": "Get Latest Captured Image (JSON & Base64)",
+                "description": "Returns latest captured camera image metadata and base64 encoded JPEG payload.",
+                "responses": {
+                    "200": {
+                        "description": "Latest camera image metadata and base64",
+                        "content": {"application/json": {}},
+                    },
+                    "404": {"description": "No camera image captured yet"},
+                },
+            }
+        },
+        "/api/camera/latest.jpg": {
+            "get": {
+                "tags": ["Camera"],
+                "summary": "Get Latest Captured Image (Raw JPEG Binary)",
+                "description": "Serves the latest captured satellite image as raw image/jpeg binary stream.",
+                "responses": {
+                    "200": {
+                        "description": "Raw JPEG image binary",
+                        "content": {"image/jpeg": {}},
+                    },
+                    "404": {"description": "No camera image captured yet"},
+                },
+            }
+        },
     },
 }
 
@@ -697,6 +872,28 @@ HTML_DASHBOARD = """<!DOCTYPE html>
       <h2 style="margin-top: 1.5rem;">📜 Latest Telemetry JSON & Raw HEX</h2>
       <pre id="jsonDisplay">// Waiting for telemetry data...</pre>
     </div>
+
+    <!-- Satellite Camera Section -->
+    <div class="card">
+      <h2>📷 Satellite Camera Capture</h2>
+      <div style="display: flex; gap: 1rem; align-items: center; margin-bottom: 1rem; flex-wrap: wrap;">
+        <button id="btnCameraCapture" onclick="triggerCameraCapture()">📸 Trigger Camera Capture</button>
+        <span id="cameraStatusText" style="font-size: 0.9rem; color: var(--text-muted);">Status: Idle</span>
+      </div>
+
+      <div id="cameraProgressContainer" style="display: none; margin-bottom: 1.25rem;">
+        <div style="font-size: 0.85rem; color: var(--accent); margin-bottom: 0.4rem;" id="cameraProgressDetails">Receiving blocks...</div>
+        <div style="background: rgba(255,255,255,0.08); border-radius: 6px; height: 8px; overflow: hidden;">
+          <div id="cameraProgressBar" style="width: 100%; height: 100%; background: linear-gradient(90deg, #0284c7, #38bdf8); animation: pulse 1.5s infinite;"></div>
+        </div>
+      </div>
+
+      <div id="cameraImageContainer" style="text-align: center; background: rgba(5, 8, 15, 0.6); border-radius: 12px; padding: 1.25rem; min-height: 200px; display: flex; flex-direction: column; align-items: center; justify-content: center; border: 1px dashed var(--card-border);">
+        <img id="cameraImgPreview" src="" alt="Satellite Capture Preview" style="max-width: 100%; max-height: 400px; border-radius: 8px; display: none; box-shadow: 0 4px 20px rgba(0,0,0,0.5);" />
+        <div id="cameraPlaceholder" style="color: var(--text-muted); font-size: 0.88rem;">No camera image captured yet. Click "Trigger Camera Capture" to take a picture.</div>
+        <div id="cameraMetaInfo" style="margin-top: 0.75rem; font-size: 0.82rem; color: #a5f3fc; font-family: 'JetBrains Mono', monospace; display: none;"></div>
+      </div>
+    </div>
   </div>
 
   <script>
@@ -705,6 +902,7 @@ HTML_DASHBOARD = """<!DOCTYPE html>
     let clientPort = null;
     let clientReader = null;
     let isClientConnected = false;
+    let cameraPollingInterval = null;
 
     function switchTab(mode) {
       if (mode === 'client') {
@@ -718,6 +916,81 @@ HTML_DASHBOARD = """<!DOCTYPE html>
         document.getElementById('tabClientBtn').className = 'tab-btn';
         document.getElementById('tabServerBtn').className = 'tab-btn active';
       }
+    }
+
+    async function triggerCameraCapture() {
+      const btn = document.getElementById('btnCameraCapture');
+      btn.disabled = true;
+      btn.innerText = '⏳ Requesting...';
+      try {
+        const res = await fetch('/api/camera/capture', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({ timeout: 35.0 })
+        });
+        const data = await res.json();
+        if (!res.ok) {
+          alert(data.error || 'Failed to trigger camera capture');
+          btn.disabled = false;
+          btn.innerText = '📸 Trigger Camera Capture';
+          return;
+        }
+        document.getElementById('cameraProgressContainer').style.display = 'block';
+        document.getElementById('cameraStatusText').innerText = 'Status: Capturing image...';
+        if (cameraPollingInterval) clearInterval(cameraPollingInterval);
+        cameraPollingInterval = setInterval(pollCameraStatus, 800);
+      } catch (err) {
+        alert('Camera request error: ' + err.message);
+        btn.disabled = false;
+        btn.innerText = '📸 Trigger Camera Capture';
+      }
+    }
+
+    async function pollCameraStatus() {
+      try {
+        const res = await fetch('/api/camera/status');
+        const data = await res.json();
+        const btn = document.getElementById('btnCameraCapture');
+        const statusText = document.getElementById('cameraStatusText');
+        const progDetails = document.getElementById('cameraProgressDetails');
+
+        if (data.status === 'capturing') {
+          statusText.innerText = `Status: Capturing (${data.progress.elapsed_seconds}s)`;
+          progDetails.innerText = `Blocks received: ${data.progress.blocks_received} (${(data.progress.total_bytes / 1024).toFixed(1)} KB)`;
+        } else if (data.status === 'completed') {
+          clearInterval(cameraPollingInterval);
+          cameraPollingInterval = null;
+          btn.disabled = false;
+          btn.innerText = '📸 Trigger Camera Capture';
+          statusText.innerText = 'Status: Capture Complete! 🎉';
+          document.getElementById('cameraProgressContainer').style.display = 'none';
+          loadLatestCameraImage();
+        } else if (data.status === 'failed') {
+          clearInterval(cameraPollingInterval);
+          cameraPollingInterval = null;
+          btn.disabled = false;
+          btn.innerText = '📸 Trigger Camera Capture';
+          statusText.innerText = `Status: Failed (${data.progress.error || 'Timeout'})`;
+          document.getElementById('cameraProgressContainer').style.display = 'none';
+        }
+      } catch (e) {}
+    }
+
+    async function loadLatestCameraImage() {
+      try {
+        const res = await fetch('/api/camera/latest');
+        if (!res.ok) return;
+        const data = await res.json();
+        const img = document.getElementById('cameraImgPreview');
+        const placeholder = document.getElementById('cameraPlaceholder');
+        const meta = document.getElementById('cameraMetaInfo');
+
+        img.src = `/api/camera/latest.jpg?t=${Date.now()}`;
+        img.style.display = 'block';
+        placeholder.style.display = 'none';
+        meta.style.display = 'block';
+        meta.innerText = `Size: ${(data.metadata.byte_length / 1024).toFixed(1)} KB | Blocks: ${data.metadata.block_count} | Duration: ${data.metadata.capture_duration_seconds}s`;
+      } catch (e) {}
     }
 
     async function handleClientWebSerial() {
@@ -927,6 +1200,7 @@ HTML_DASHBOARD = """<!DOCTYPE html>
 
     loadPorts();
     checkStatus();
+    loadLatestCameraImage();
     setInterval(checkStatus, 3000);
   </script>
 </body>
@@ -1075,6 +1349,48 @@ class GroundStationAPIHandler(BaseHTTPRequestHandler):
                 self._send_json(HTTPStatus.UNPROCESSABLE_ENTITY, {"error": str(exc)})
             return
 
+        # 10. Camera Capture Status
+        if path == "/api/camera/status":
+            with state.lock:
+                self._send_json(HTTPStatus.OK, {
+                    "status": state.camera_status,
+                    "progress": state.camera_progress,
+                    "has_image": state.latest_image is not None,
+                    "metadata": state.latest_image_metadata,
+                    "image_url": "/api/camera/latest.jpg" if state.latest_image is not None else None,
+                })
+            return
+
+        # 11. Latest Camera Image (JSON & Base64)
+        if path == "/api/camera/latest":
+            with state.lock:
+                if state.latest_image is None:
+                    self._send_json(HTTPStatus.NOT_FOUND, {"error": "No camera image captured yet"})
+                    return
+                b64_img = base64.b64encode(state.latest_image).decode("ascii")
+                self._send_json(HTTPStatus.OK, {
+                    "metadata": state.latest_image_metadata,
+                    "image_url": "/api/camera/latest.jpg",
+                    "jpeg_base64": b64_img,
+                })
+            return
+
+        # 12. Latest Camera Image (Raw JPEG Binary)
+        if path in ("/api/camera/latest.jpg", "/api/camera/image"):
+            with state.lock:
+                if state.latest_image is None:
+                    self._send_json(HTTPStatus.NOT_FOUND, {"error": "No camera image captured yet"})
+                    return
+                img_data = state.latest_image
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", "image/jpeg")
+            self.send_header("Content-Length", str(len(img_data)))
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("Cache-Control", "no-cache")
+            self.end_headers()
+            self.wfile.write(img_data)
+            return
+
         self._send_json(HTTPStatus.NOT_FOUND, {"error": "Endpoint not found"})
 
     def do_POST(self) -> None:
@@ -1159,7 +1475,25 @@ class GroundStationAPIHandler(BaseHTTPRequestHandler):
                 self._send_json(HTTPStatus.UNPROCESSABLE_ENTITY, {"error": str(exc)})
             return
 
-        # 4. Decode HEX Body
+        # 4. Trigger Camera Capture
+        if path == "/api/camera/capture":
+            timeout_val = float(body_json.get("timeout", 35.0))
+            try:
+                trigger_camera_capture(timeout=timeout_val)
+                self._send_json(HTTPStatus.ACCEPTED, {
+                    "status": "capturing",
+                    "message": f"Camera capture initiated with {timeout_val:.1f}s timeout",
+                    "check_status_url": "/api/camera/status",
+                })
+            except SessionBusyError as exc:
+                self._send_json(HTTPStatus.CONFLICT, {"error": str(exc)})
+            except (ConnectionError, RuntimeError) as exc:
+                self._send_json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": str(exc)})
+            except Exception as exc:
+                self._send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(exc)})
+            return
+
+        # 5. Decode HEX Body
         if path == "/api/decode":
             hex_data = body_json.get("hex") or body_json.get("payload") or raw_body.strip().strip('"')
             if not hex_data:
