@@ -19,28 +19,20 @@ import os
 import sys
 import time
 
-# Ensure workspace src/ directory and .venv packages are included in sys.path
+# Ensure workspace src/ directory is included in sys.path
 WORKSPACE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 WORKSPACE_SRC = os.path.join(WORKSPACE_DIR, "src")
 if WORKSPACE_SRC not in sys.path:
     sys.path.insert(0, WORKSPACE_SRC)
 
-# Include venv site-packages if running from system python
-for venv_site in [
-    os.path.join(WORKSPACE_DIR, ".venv", "lib", f"python{v}", "site-packages")
-    for v in ["3.12", "3.13", "3.14", "3.11"]
-]:
-    if os.path.exists(venv_site) and venv_site not in sys.path:
-        sys.path.insert(0, venv_site)
+# Clean sys.path from incompatible other Python version site-packages
+current_py = f"python{sys.version_info.major}.{sys.version_info.minor}"
+sys.path = [p for p in sys.path if not any(f"python3.{v}" in p for v in range(8, 20) if f"python3.{v}" != current_py)]
 
-# Ensure Homebrew GNU Radio Python paths are included
-for p in [
-    "/opt/homebrew/lib/python3.14/site-packages",
-    "/opt/homebrew/lib/python3.13/site-packages",
-    "/opt/homebrew/lib/python3.12/site-packages",
-]:
-    if os.path.exists(p) and p not in sys.path:
-        sys.path.insert(0, p)
+# Ensure Homebrew GNU Radio Python paths for current python version are included
+hb_site = f"/opt/homebrew/lib/{current_py}/site-packages"
+if os.path.exists(hb_site) and hb_site not in sys.path:
+    sys.path.insert(0, hb_site)
 
 from rascube_v2.decoder import decode_main_telemetry_hex
 from rascube_v2.models.obc import FirmwareInfo, ObcInfo
@@ -55,6 +47,7 @@ def main() -> None:
     parser.add_argument("--sf", type=int, default=7, help="LoRa Spreading Factor (default: 7)")
     parser.add_argument("--bw", type=int, default=125_000, help="LoRa Bandwidth in Hz (default: 125000)")
     parser.add_argument("--hex", action="store_true", help="Print raw HEX telemetry packets instead of metrics")
+    parser.add_argument("--port", type=int, default=9090, help="UDP listening port for SDR stream (default: 9090)")
 
     args = parser.parse_args()
 
@@ -80,7 +73,7 @@ def main() -> None:
     print("=" * 65)
 
     import pmt
-    from gnuradio import blocks, gr, iio
+    from gnuradio import blocks, gr, network
     from gnuradio.lora_sdr import lora_sdr_lora_rx
 
     class TelemetryHandlerBlock(gr.sync_block):
@@ -111,43 +104,45 @@ def main() -> None:
         def __init__(self) -> None:
             super().__init__("PlutoSDR LoRa Receiver")
 
-            # 1. PlutoSDR Hardware Source
-            self.sdr_source = iio.pluto_source(
-                args.uri,
-                int(freq_hz),
-                1_000_000,  # 1 MSPS
-                int(args.bw * 2),
-                0x8000,
-                True,
+            # 1. UDP / Network I/Q Source from PlutoSDR stream
+            self.iq_source = network.udp_source(
+                8,  # sizeof(gr_complex) = 8 bytes
+                1,
+                args.port,
+                0,
+                1472,
+                False,
+                False,
+                False,
             )
-            self.sdr_source.set_gain(0, float(args.gain))
 
             # 2. LoRa SDR Receiver Block
             self.lora_rx = lora_sdr_lora_rx(
+                center_freq=int(freq_hz),
                 bw=int(args.bw),
                 cr=1,  # 4/5
                 has_crc=True,
                 impl_head=False,
-                ldo=False,
                 pay_len=121,
-                print_rx=[False],
                 samp_rate=1_000_000,
                 sf=int(args.sf),
-                soft_decoding=True,
                 sync_word=[0x34],
+                soft_decoding=True,
+                ldro_mode=0,
+                print_rx=[False, False],
             )
 
-            # 3. Custom Output Handler
+            # 3. Output Handler
             self.handler = TelemetryHandlerBlock(is_hex=args.hex)
 
             # Connect Blocks
-            self.connect((self.sdr_source, 0), (self.lora_rx, 0))
+            self.connect((self.iq_source, 0), (self.lora_rx, 0))
             self.msg_connect((self.lora_rx, "out"), (self.handler, "in"))
 
     tb = PlutoLoRaFlowgraph()
     tb.start()
 
-    print(f"[Pluto+ SDR] Connected ({args.uri}) and tuned to {freq_hz/1e6:.3f} MHz.")
+    print(f"[Pluto+ SDR] Demodulator active on {freq_hz/1e6:.3f} MHz (Listening on UDP:{args.port}).")
     print(f"Streaming live telemetry from Sat #{serial_number} via gr-lora_sdr (Ctrl+C to stop)...\n")
 
     try:
@@ -162,4 +157,5 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
 
