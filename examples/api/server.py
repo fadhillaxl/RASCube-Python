@@ -358,6 +358,43 @@ OPENAPI_SCHEMA: dict[str, Any] = {
                 },
             }
         },
+        "/api/telemetry/ingest": {
+            "post": {
+                "tags": ["Telemetry"],
+                "summary": "Ingest Telemetry from Client Web Serial",
+                "description": "Allows a browser client reading local USB via Web Serial API to push raw telemetry packets to the server, decoding and broadcasting to all SSE dashboard clients.",
+                "requestBody": {
+                    "required": True,
+                    "content": {
+                        "application/json": {
+                            "schema": {
+                                "type": "object",
+                                "required": ["hex"],
+                                "properties": {
+                                    "hex": {
+                                        "type": "string",
+                                        "description": "Raw 121-byte payload or 123-byte 10 79... HEX frame",
+                                        "example": "10796C3100008E13EC0CFB0FFA0FFB0FD80F000090070000D00FFA0020010000F0000000A001000000000D591A00ABFF2E0B0700360139A6C4474049A43F000014010DBFFFFF000005009670C8C0EE9DD5429A99154200000000000000009A99993F0801D36237C2636FAD41C4981B440000090000F8C100005441",
+                                    },
+                                    "source": {
+                                        "type": "string",
+                                        "description": "Optional source label",
+                                        "example": "browser_web_serial",
+                                    },
+                                },
+                            }
+                        }
+                    },
+                },
+                "responses": {
+                    "200": {
+                        "description": "Telemetry ingested and broadcasted successfully",
+                        "content": {"application/json": {}},
+                    },
+                    "422": {"description": "Invalid packet payload"},
+                },
+            }
+        },
         "/api/decode": {
             "post": {
                 "tags": ["Telemetry"],
@@ -525,6 +562,7 @@ HTML_DASHBOARD = """<!DOCTYPE html>
       --accent-glow: rgba(56, 189, 248, 0.25);
       --success: #10b981;
       --danger: #ef4444;
+      --warning: #f59e0b;
       --text: #f1f5f9;
       --text-muted: #94a3b8;
     }
@@ -538,7 +576,11 @@ HTML_DASHBOARD = """<!DOCTYPE html>
     .status-badge { display: inline-flex; align-items: center; gap: 0.5rem; padding: 0.35rem 0.85rem; border-radius: 9999px; font-size: 0.85rem; font-weight: 700; }
     .status-connected { background: rgba(16, 185, 129, 0.15); border: 1px solid var(--success); color: var(--success); }
     .status-disconnected { background: rgba(239, 68, 68, 0.15); border: 1px solid var(--danger); color: var(--danger); }
+    .status-client { background: rgba(56, 189, 248, 0.15); border: 1px solid var(--accent); color: var(--accent); }
     .status-dot { width: 8px; height: 8px; border-radius: 50%; background: currentColor; }
+    .tabs { display: flex; gap: 0.5rem; margin-bottom: 1.25rem; border-bottom: 1px solid var(--card-border); padding-bottom: 0.5rem; }
+    .tab-btn { background: transparent; color: var(--text-muted); border: none; padding: 0.6rem 1.2rem; font-size: 0.9rem; font-weight: 700; border-radius: 8px; cursor: pointer; transition: all 0.2s; }
+    .tab-btn.active { background: rgba(56, 189, 248, 0.15); color: var(--accent); border: 1px solid var(--accent); }
     .card { background: var(--card-bg); backdrop-filter: blur(12px); border: 1px solid var(--card-border); border-radius: 16px; padding: 1.5rem; margin-bottom: 1.5rem; box-shadow: 0 10px 30px rgba(0,0,0,0.3); }
     .card h2 { font-size: 1.15rem; font-weight: 700; margin-bottom: 1rem; display: flex; align-items: center; gap: 0.5rem; }
     .form-grid { display: grid; grid-template-columns: 2fr 1fr auto auto; gap: 1rem; align-items: end; }
@@ -555,6 +597,7 @@ HTML_DASHBOARD = """<!DOCTYPE html>
     .metric-value { font-size: 1.35rem; font-weight: 700; font-family: 'JetBrains Mono', monospace; color: #fff; margin-top: 0.25rem; }
     .metric-sub { font-size: 0.75rem; color: var(--text-muted); margin-top: 0.25rem; font-family: 'JetBrains Mono', monospace; }
     pre { background: rgba(5, 8, 15, 0.95); border: 1px solid var(--card-border); border-radius: 10px; padding: 1rem; font-family: 'JetBrains Mono', monospace; font-size: 0.8rem; color: #a5f3fc; overflow-x: auto; max-height: 280px; }
+    .note-box { background: rgba(56, 189, 248, 0.08); border-left: 3px solid var(--accent); padding: 0.75rem 1rem; border-radius: 6px; font-size: 0.85rem; color: #cbd5e1; margin-bottom: 1rem; }
   </style>
 </head>
 <body>
@@ -573,18 +616,46 @@ HTML_DASHBOARD = """<!DOCTYPE html>
     </header>
 
     <div class="card">
-      <h2>🔌 Serial Connection Controls</h2>
-      <div class="form-grid">
-        <div>
-          <label>Select COM Port</label>
-          <select id="portSelect"></select>
+      <div class="tabs">
+        <button id="tabClientBtn" class="tab-btn active" onclick="switchTab('client')">💻 Client Web Serial (Browser USB)</button>
+        <button id="tabServerBtn" class="tab-btn" onclick="switchTab('server')">🖥️ Server COM Port (Host USB)</button>
+      </div>
+
+      <!-- Tab 1: Client Web Serial -->
+      <div id="tabClient">
+        <div class="note-box">
+          ✨ <strong>Client Web Serial Mode</strong>: Receiver USB terhubung langsung ke laptop/komputer Anda (Chrome / Edge / Opera). Data dibaca langsung oleh browser dan otomatis dikirim ke backend API.
         </div>
-        <div>
-          <label>Satellite Serial Number</label>
-          <input type="number" id="serialInput" value="1581" placeholder="e.g. 1581" />
+        <div class="form-grid" style="grid-template-columns: 1fr 1fr auto;">
+          <div>
+            <label>Satellite Serial Number</label>
+            <input type="number" id="clientSerialInput" value="1581" placeholder="e.g. 1581" />
+          </div>
+          <div>
+            <label>Baud Rate</label>
+            <input type="number" id="clientBaudInput" value="1000000" />
+          </div>
+          <button id="btnClientConnect" onclick="handleClientWebSerial()">🔌 Connect Browser USB</button>
         </div>
-        <button id="btnConnect" onclick="handleConnect()">⚡ Connect</button>
-        <button class="btn-secondary" onclick="loadPorts()">🔄 Refresh Ports</button>
+      </div>
+
+      <!-- Tab 2: Server COM Port -->
+      <div id="tabServer" style="display: none;">
+        <div class="note-box">
+          🖥️ <strong>Server Port Mode</strong>: Receiver USB terhubung ke komputer yang menjalankan server Python.
+        </div>
+        <div class="form-grid">
+          <div>
+            <label>Select COM Port</label>
+            <select id="portSelect"></select>
+          </div>
+          <div>
+            <label>Satellite Serial Number</label>
+            <input type="number" id="serialInput" value="1581" placeholder="e.g. 1581" />
+          </div>
+          <button id="btnConnect" onclick="handleConnect()">⚡ Connect</button>
+          <button class="btn-secondary" onclick="loadPorts()">🔄 Refresh Ports</button>
+        </div>
       </div>
     </div>
 
@@ -631,6 +702,145 @@ HTML_DASHBOARD = """<!DOCTYPE html>
   <script>
     let isConnected = false;
     let sseSource = null;
+    let clientPort = null;
+    let clientReader = null;
+    let isClientConnected = false;
+
+    function switchTab(mode) {
+      if (mode === 'client') {
+        document.getElementById('tabClient').style.display = 'block';
+        document.getElementById('tabServer').style.display = 'none';
+        document.getElementById('tabClientBtn').className = 'tab-btn active';
+        document.getElementById('tabServerBtn').className = 'tab-btn';
+      } else {
+        document.getElementById('tabClient').style.display = 'none';
+        document.getElementById('tabServer').style.display = 'block';
+        document.getElementById('tabClientBtn').className = 'tab-btn';
+        document.getElementById('tabServerBtn').className = 'tab-btn active';
+      }
+    }
+
+    async function handleClientWebSerial() {
+      if (isClientConnected) {
+        // Disconnect
+        try {
+          if (clientReader) await clientReader.cancel();
+          if (clientPort) await clientPort.close();
+        } catch (e) {}
+        isClientConnected = false;
+        clientPort = null;
+        clientReader = null;
+        document.getElementById('btnClientConnect').innerText = '🔌 Connect Browser USB';
+        document.getElementById('btnClientConnect').className = '';
+        checkStatus();
+        return;
+      }
+
+      if (!('serial' in navigator)) {
+        alert('Browser Anda belum mendukung Web Serial API. Silakan gunakan Google Chrome, Edge, atau Opera.');
+        return;
+      }
+
+      try {
+        clientPort = await navigator.serial.requestPort({
+          filters: [{ usbVendorId: 0x0483, usbProductId: 0x5740 }]
+        });
+        const baudRate = parseInt(document.getElementById('clientBaudInput').value, 10) || 1000000;
+        await clientPort.open({ baudRate });
+
+        const satNum = parseInt(document.getElementById('clientSerialInput').value, 10) || 1581;
+
+        // Kirim filter serial number ke receiver: port 0x01, len 4, uint32 little-endian
+        const writer = clientPort.writable.getWriter();
+        const cmd = new Uint8Array(6);
+        cmd[0] = 0x01; // HostPort.USB_SERIAL_FILTER
+        cmd[1] = 0x04; // Length 4 bytes
+        const view = new DataView(cmd.buffer);
+        view.setUint32(2, satNum, true);
+        await writer.write(cmd);
+        writer.releaseLock();
+
+        isClientConnected = true;
+        document.getElementById('btnClientConnect').innerText = 'Disconnect Browser USB';
+        document.getElementById('btnClientConnect').className = 'btn-danger';
+
+        const badge = document.getElementById('statusBadge');
+        const text = document.getElementById('statusText');
+        badge.className = 'status-badge status-client';
+        text.innerText = `Client USB: Sat #${satNum}`;
+
+        readClientSerialLoop();
+      } catch (err) {
+        alert('Koneksi Web Serial gagal: ' + err.message);
+      }
+    }
+
+    async function readClientSerialLoop() {
+      let buffer = new Uint8Array();
+      while (clientPort && clientPort.readable && isClientConnected) {
+        try {
+          clientReader = clientPort.readable.getReader();
+          while (true) {
+            const { value, done } = await clientReader.read();
+            if (done) break;
+            if (value) {
+              const merged = new Uint8Array(buffer.length + value.length);
+              merged.set(buffer);
+              merged.set(value, buffer.length);
+              buffer = merged;
+
+              // Cari header 0x10 0x79 (panjang 123 bytes)
+              while (buffer.length >= 123) {
+                let headerIdx = -1;
+                for (let i = 0; i <= buffer.length - 123; i++) {
+                  if (buffer[i] === 0x10 && buffer[i + 1] === 0x79) {
+                    headerIdx = i;
+                    break;
+                  }
+                }
+                if (headerIdx === -1) {
+                  // Simpan 2 byte terakhir untuk mengantisipasi header terpotong
+                  buffer = buffer.slice(-2);
+                  break;
+                }
+
+                if (buffer.length >= headerIdx + 123) {
+                  const frame = buffer.slice(headerIdx, headerIdx + 123);
+                  buffer = buffer.slice(headerIdx + 123);
+
+                  const hex = Array.from(frame)
+                    .map(b => b.toString(16).padStart(2, '0'))
+                    .join('')
+                    .toUpperCase();
+
+                  // Push ke backend via /api/telemetry/ingest
+                  fetch('/api/telemetry/ingest', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ hex, source: 'client_web_serial' })
+                  })
+                  .then(r => r.json())
+                  .then(res => {
+                    if (res.telemetry) renderTelemetry(res.telemetry);
+                  })
+                  .catch(console.error);
+                } else {
+                  break;
+                }
+              }
+            }
+          }
+        } catch (e) {
+          console.warn('Web Serial stream error:', e);
+          break;
+        } finally {
+          if (clientReader) {
+            try { clientReader.releaseLock(); } catch(e) {}
+            clientReader = null;
+          }
+        }
+      }
+    }
 
     async function loadPorts() {
       const res = await fetch('/api/ports');
@@ -647,6 +857,8 @@ HTML_DASHBOARD = """<!DOCTYPE html>
     }
 
     async function checkStatus() {
+      if (isClientConnected) return; // Do not overwrite client UI state
+
       const res = await fetch('/api/status');
       const data = await res.json();
       isConnected = data.is_connected;
@@ -656,7 +868,7 @@ HTML_DASHBOARD = """<!DOCTYPE html>
 
       if (isConnected) {
         badge.className = 'status-badge status-connected';
-        text.innerText = `Connected: ${data.connected_port} (#${data.serial_number})`;
+        text.innerText = `Server: ${data.connected_port} (#${data.serial_number})`;
         btn.innerText = 'Disconnect';
         btn.className = 'btn-danger';
         if (!sseSource) initSSE();
@@ -841,6 +1053,7 @@ class GroundStationAPIHandler(BaseHTTPRequestHandler):
                         self.wfile.write(msg)
                         self.wfile.flush()
                     except queue.Empty:
+                        # Keep-alive comment
                         self.wfile.write(b": ping\n\n")
                         self.wfile.flush()
             except (BrokenPipeError, ConnectionResetError):
@@ -875,7 +1088,7 @@ class GroundStationAPIHandler(BaseHTTPRequestHandler):
         except json.JSONDecodeError:
             body_json = {}
 
-        # 1. Connect to Port & Set Satellite Serial Number
+        # 1. Connect to Port & Set Satellite Serial Number (Server Host USB)
         if path == "/api/connect":
             port = body_json.get("port")
             serial_number = body_json.get("serial_number")
@@ -921,7 +1134,7 @@ class GroundStationAPIHandler(BaseHTTPRequestHandler):
                 })
             return
 
-        # 2. Disconnect
+        # 2. Disconnect (Server Host USB)
         if path == "/api/disconnect":
             with state.lock:
                 state.stop_signal.set()
@@ -929,7 +1142,24 @@ class GroundStationAPIHandler(BaseHTTPRequestHandler):
             self._send_json(HTTPStatus.OK, {"status": "disconnected"})
             return
 
-        # 3. Decode HEX Body
+        # 3. Ingest Telemetry from Client Web Serial
+        if path == "/api/telemetry/ingest":
+            hex_data = body_json.get("hex") or body_json.get("payload") or raw_body.strip().strip('"')
+            if not hex_data:
+                self._send_json(HTTPStatus.BAD_REQUEST, {"error": "Missing 'hex' in request body"})
+                return
+            try:
+                decoded = decode_telemetry_to_dict(hex_data)
+                decoded["raw_hex"] = hex_data if isinstance(hex_data, str) else hex_data.hex().upper()
+                decoded["timestamp"] = time.time()
+                decoded["source"] = body_json.get("source", "client_web_serial")
+                state.broadcast_telemetry(decoded)
+                self._send_json(HTTPStatus.OK, {"status": "ingested", "telemetry": decoded})
+            except (ProtocolDecodeError, ValueError) as exc:
+                self._send_json(HTTPStatus.UNPROCESSABLE_ENTITY, {"error": str(exc)})
+            return
+
+        # 4. Decode HEX Body
         if path == "/api/decode":
             hex_data = body_json.get("hex") or body_json.get("payload") or raw_body.strip().strip('"')
             if not hex_data:

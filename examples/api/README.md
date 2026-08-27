@@ -12,25 +12,28 @@ This tutorial explains how to run, test, and integrate the **RASCubeV2 Ground St
 4. [Interactive Swagger UI & Web Dashboard](#interactive-swagger-ui--web-dashboard)
 5. [API Endpoint Reference](#api-endpoint-reference)
    - [1. List Available Ports](#1-list-available-ports)
-   - [2. Connect to Satellite](#2-connect-to-satellite)
+   - [2. Connect to Satellite (Server Host Mode)](#2-connect-to-satellite-server-host-mode)
    - [3. Disconnect from Satellite](#3-disconnect-from-satellite)
    - [4. Check Connection Status](#4-check-connection-status)
    - [5. Get Latest Telemetry (Snapshot)](#5-get-latest-telemetry-snapshot)
    - [6. Get Telemetry History Buffer](#6-get-telemetry-history-buffer)
    - [7. Realtime Live Stream (SSE)](#7-realtime-live-stream-sse)
-   - [8. Decode Raw HEX Telemetry](#8-decode-raw-hex-telemetry)
-6. [Frontend Integration Guide (React / Vite / JavaScript)](#frontend-integration-guide-react--vite--javascript)
-7. [Troubleshooting & FAQs](#troubleshooting--faqs)
+   - [8. Ingest Telemetry from Client Web Serial](#8-ingest-telemetry-from-client-web-serial)
+   - [9. Decode Raw HEX Telemetry](#9-decode-raw-hex-telemetry)
+6. [Client Web Serial Guide (Connecting USB from User Browser)](#client-web-serial-guide-connecting-usb-from-user-browser)
+7. [Frontend Integration Guide (React / Vite / JavaScript)](#frontend-integration-guide-react--vite--javascript)
+8. [Troubleshooting & FAQs](#troubleshooting--faqs)
 
 ---
 
 ## Features
 
 - 🔌 **Zero External Web Dependencies**: Uses Python's built-in `http.server` and threading. No extra frameworks required.
+- 💻 **Client Web Serial (Browser USB)**: Direct USB receiver reading via Chrome/Edge Web Serial API, with automatic ingestion to the backend.
 - 📖 **Interactive Swagger UI**: Full OpenAPI 3.0 documentation available at `/docs`.
 - ⚡ **Realtime Streaming (SSE)**: Native Server-Sent Events stream for instant updates in frontend dashboards without polling overhead.
 - 🌐 **Cross-Origin Enabled (CORS)**: Pre-configured CORS headers allow any React/Vite/Vue frontend to communicate seamlessly.
-- 🛠️ **Dual Mode Telemetry**: Supports live satellite stream from hardware USB receiver and standalone offline HEX string decoding.
+- 🛠️ **Dual Mode Telemetry**: Supports live satellite stream from hardware USB receiver (Server or Client) and standalone offline HEX string decoding.
 
 ---
 
@@ -298,7 +301,45 @@ Provides a persistent Server-Sent Events (SSE) stream pushing new telemetry samp
 
 ---
 
-### 8. Decode Raw HEX Telemetry
+### 8. Ingest Telemetry from Client Web Serial
+
+Allows a browser client reading local USB via the Web Serial API to push raw telemetry packets to the server. The server parses the packet, saves it to memory history, and broadcasts it to all connected SSE clients.
+
+- **Method**: `POST`
+- **URL**: `/api/telemetry/ingest`
+- **Headers**: `Content-Type: application/json`
+- **Body**:
+  ```json
+  {
+    "hex": "10796C3100008E13EC0CFB0FFA0FFB0FD80F000090070000D00FFA0020010000F0000000A001000000000D591A00ABFF2E0B0700360139A6C4474049A43F000014010DBFFFFF000005009670C8C0EE9DD5429A99154200000000000000009A99993F0801D36237C2636FAD41C4981B440000090000F8C100005441",
+    "source": "client_web_serial"
+  }
+  ```
+- **Example cURL**:
+  ```bash
+  curl -X POST http://localhost:8080/api/telemetry/ingest \
+       -H "Content-Type: application/json" \
+       -d '{"hex": "10796C3100008E13EC0C...", "source": "client_web_serial"}'
+  ```
+- **Example Response (200 OK)**:
+  ```json
+  {
+    "status": "ingested",
+    "telemetry": {
+      "packet_sequence": 12652,
+      "device_uptime_ms": 1726733,
+      "barometer": { "temperature_c": 31.0, "pressure_hpa": 1006.84, "altitude_m": 1.28 },
+      "eps": { "...": "..." },
+      "imu": { "...": "..." },
+      "gps": { "...": "..." },
+      "timestamp": 1787574341.26
+    }
+  }
+  ```
+
+---
+
+### 9. Decode Raw HEX Telemetry
 
 Decodes any 121-byte raw telemetry payload or 123-byte (`10 79...`) frame string into structured JSON.
 
@@ -317,6 +358,19 @@ Decodes any 121-byte raw telemetry payload or 123-byte (`10 79...`) frame string
        -H "Content-Type: application/json" \
        -d '{"hex": "10796C3100008E13EC0C..."}'
   ```
+
+---
+
+## Client Web Serial Guide (Connecting USB from User Browser)
+
+You do **not** need the USB dongle plugged into the server machine. When using a Chromium browser (Chrome, Edge, Opera), users can connect their USB receiver directly to their own computer:
+
+1. Open the dashboard at `http://localhost:8080/` (or your hosted domain).
+2. Select the **"💻 Client Web Serial (Browser USB)"** tab.
+3. Enter your **Satellite Serial Number** (e.g. `1581`).
+4. Click **"🔌 Connect Browser USB"**.
+5. Select the **RASCube Receiver** (`USB VID: 0x0483, PID: 0x5740`) in the browser popup prompt.
+6. The browser will automatically establish serial communication at 1,000,000 baud, send the satellite filter header, stream packets, and push decoded telemetry via `/api/telemetry/ingest`.
 
 ---
 
