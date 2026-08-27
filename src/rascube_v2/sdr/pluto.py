@@ -8,6 +8,8 @@ import time
 from collections.abc import Callable, Iterator
 from typing import Any
 
+import numpy as np
+
 from rascube_v2.constants import BANDWIDTH_KHZ
 from rascube_v2.decoder import decode_main_telemetry_hex, decode_telemetry_to_dict
 from rascube_v2.models.telemetry import MainTelemetrySample
@@ -142,45 +144,24 @@ class PlutoSDRReceiver:
         self._thread.start()
 
     def _sdr_rx_worker(self) -> None:
-        """Continuous background thread streaming Pluto+ SDR raw I/Q samples to GNU Radio via TCP."""
-        tcp_sock = None
+        """Continuous background thread streaming Pluto+ SDR raw I/Q samples to GNU Radio via UDP."""
+        udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        CHUNK = 1472  # bytes per UDP datagram = 184 complex64 samples
         while self._running and self._sdr_device is not None:
             try:
-                if tcp_sock is None:
-                    try:
-                        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                        s.settimeout(0.5)
-                        s.connect(("127.0.0.1", 9090))
-                        tcp_sock = s
-                    except Exception:
-                        tcp_sock = None
-
                 iq_data = self._sdr_device.rx()
                 if iq_data is None or len(iq_data) == 0:
                     time.sleep(0.002)
                     continue
 
-                if tcp_sock is not None:
-                    try:
-                        raw_c64 = iq_data.astype(np.complex64).tobytes()
-                        tcp_sock.sendall(raw_c64)
-                    except Exception:
-                        tcp_sock = None
+                # Forward raw complex64 I/Q to GNU Radio gr-lora_sdr via UDP
+                try:
+                    raw_c64 = iq_data.astype(np.complex64).tobytes()
+                    for i in range(0, len(raw_c64), CHUNK):
+                        udp_sock.sendto(raw_c64[i : i + CHUNK], ("127.0.0.1", 9090))
+                except Exception:
+                    pass
 
-                # Also run software DSP
-                if self._dsp is not None:
-                    packets = self._dsp.demodulate_samples(iq_data)
-                    for pkt in packets:
-                        self.total_packets_received += 1
-                        hex_str = pkt.hex().upper()
-                        if self.on_raw_hex:
-                            self.on_raw_hex(hex_str)
-                        if self.on_sample:
-                            try:
-                                sample = decode_main_telemetry_hex(pkt)
-                                self.on_sample(sample)
-                            except Exception:
-                                pass
             except Exception:
                 if self._running:
                     time.sleep(0.01)

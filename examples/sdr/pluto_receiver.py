@@ -2,25 +2,21 @@
 """PlutoSDR (ADALM-PLUTO) Standalone Ground Station Telemetry Receiver.
 
 Uses PlutoSDR hardware directly as a complete replacement for the USB dongle:
-- Connects directly to PlutoSDR via Network IP (192.168.2.10 / 192.168.2.1) or USB
-- Tunes RF front-end to 925.000 MHz (Channel 15 for Sat #1581)
-- Performs real-time Software LoRa DSP Demodulation (SF7, BW 125kHz, CR 4/5)
+- Connects directly to PlutoSDR via USB (or Network IP)
+- Tunes RF front-end to target frequency (e.g. 925.000 MHz for Sat #1581)
+- Runs GNU Radio gr-lora_sdr demodulator as subprocess
 - Streams telemetry data samples continuously (or raw HEX with --hex)
 
 Usage:
-  # Stream live telemetry directly from PlutoSDR hardware:
-  python examples/sdr/pluto_receiver.py
-
-  # Stream raw HEX packets (1079...):
-  python examples/sdr/pluto_receiver.py --hex
-
-  # Specify satellite number or PlutoSDR IP:
-  python examples/sdr/pluto_receiver.py --sat 1581 --uri ip:192.168.2.10
+  python examples/sdr/pluto_receiver.py --sat 1581
+  python examples/sdr/pluto_receiver.py --sat 1581 --hex
+  python examples/sdr/pluto_receiver.py --freq 926.2
 """
 
 from __future__ import annotations
 
 import argparse
+import subprocess
 import sys
 import time
 
@@ -40,8 +36,6 @@ def main() -> None:
     parser.add_argument("--sf", type=int, default=7, help="LoRa Spreading Factor (default: 7)")
     parser.add_argument("--bw", type=int, default=125_000, help="LoRa Bandwidth in Hz (default: 125000)")
     parser.add_argument("--hex", action="store_true", help="Print raw HEX telemetry packets instead of metrics")
-    parser.add_argument("--udp", action="store_true", help="Also listen for external demodulator packets on UDP port 9090")
-    parser.add_argument("--port", type=int, default=9090, help="UDP port for external bridge (default: 9090)")
 
     args = parser.parse_args()
 
@@ -58,18 +52,18 @@ def main() -> None:
         freq_mhz = (916_000_000 + (serial_number % 18) * 600_000) / 1e6
         channel = serial_number % 18
 
-    # 1. Receiver & OBC Status
+    freq_hz = int(freq_mhz * 1e6)
+
+    # Print banner
     receiver_info = ReceiverInfo(software_version=7, git_hash="ADALM-PLUTO", dirty=False)
     obc_info = ObcInfo(
         stm=FirmwareInfo(software_version=9, git_hash=None, dirty=False),
         arduino=FirmwareInfo(software_version=9, git_hash=None, dirty=False),
         arduino_info_cached=False,
     )
-
     print("Receiver:", receiver_info, flush=True)
     print("OBC:", obc_info, flush=True)
     print("Enabled add-ons: []", flush=True)
-
     print("=" * 65, flush=True)
     print("🛰️ PlutoSDR (ADALM-PLUTO) Ground Station Receiver", flush=True)
     print(f"📡 Target Satellite : #{serial_number}", flush=True)
@@ -80,7 +74,7 @@ def main() -> None:
 
     config = SDRLoRaConfig(
         serial_number=serial_number,
-        custom_frequency_hz=int(freq_mhz * 1e6),
+        custom_frequency_hz=freq_hz,
         rx_gain_db=args.gain,
         spreading_factor=args.sf,
         bandwidth_hz=args.bw,
@@ -95,21 +89,16 @@ def main() -> None:
         if not args.hex:
             print(f"{sample.device_uptime_ms} {sample.gps.latitude} {sample.gps.longitude}", flush=True)
 
-    receiver = PlutoSDRReceiver(
-        config=config,
-        on_sample=on_sample,
-        on_raw_hex=on_raw_hex,
-    )
+    receiver = PlutoSDRReceiver(config=config, on_sample=on_sample, on_raw_hex=on_raw_hex)
 
-    # Start embedded GNU Radio LoRa demodulator subprocess in background
+    # -----------------------------------------------------------------------
+    # Start GNU Radio gr-lora_sdr demodulator subprocess
+    # It listens for raw I/Q UDP on port 9090 and forwards decoded LoRa
+    # packets as raw bytes via UDP to port 9091.
+    # -----------------------------------------------------------------------
     gr_proc = None
-    try:
-        gr_cmd = [
-            "/opt/homebrew/opt/python@3.14/bin/python3.14",
-            "-c",
-            f"""
+    gr_script = f"""\
 import sys
-sys.path = [p for p in sys.path if not any(f'python3.{{v}}' in p for v in range(8, 20) if f'python3.{{v}}' != 'python3.14')]
 sys.path.insert(0, '/opt/homebrew/lib/python3.14/site-packages')
 import pmt, socket
 from gnuradio import gr, network
@@ -120,71 +109,95 @@ class FrameForwarder(gr.sync_block):
         super().__init__(name='Forwarder', in_sig=None, out_sig=None)
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.message_port_register_in(pmt.intern('in'))
-        self.set_msg_handler(pmt.intern('in'), self.forward)
+        self.set_msg_handler(pmt.intern('in'), self.handle)
 
-    def forward(self, msg):
-        data = pmt.cdr(msg) if pmt.is_pair(msg) else msg
-        raw = bytes(pmt.u8vector_elements(data))
-        self.sock.sendto(raw, ('127.0.0.1', 9091))
+    def handle(self, msg):
+        try:
+            data = pmt.cdr(msg) if pmt.is_pair(msg) else msg
+            raw = bytes(pmt.u8vector_elements(data))
+            self.sock.sendto(raw, ('127.0.0.1', 9091))
+            print(f'[GR] Decoded packet: {{len(raw)}} bytes  {{raw[:8].hex().upper()}}...', flush=True)
+        except Exception as exc:
+            print(f'[GR] Forward error: {{exc}}', flush=True)
 
 tb = gr.top_block('LoRaRX')
-from gnuradio.network.tcp_source import tcp_source
-src = tcp_source(8, '127.0.0.1', 9090, True)
+src = network.udp_source(8, 1, 9090, 0, 1472, False, False, False)
 rx = lora_sdr_lora_rx(
-    center_freq={int(freq_mhz * 1e6)},
-    bw={int(args.bw)},
+    center_freq={freq_hz},
+    bw={args.bw},
     cr=1,
     has_crc=True,
     impl_head=False,
     pay_len=121,
     samp_rate=1000000,
-    sf={int(args.sf)},
+    sf={args.sf},
     sync_word=[0x12, 0x34],
     soft_decoding=True,
     ldro_mode=0,
-    print_rx=[False, False],
+    print_rx=[True, False],
 )
 fwd = FrameForwarder()
 tb.connect((src, 0), (rx, 0))
 tb.msg_connect((rx, 'out'), (fwd, 'in'))
+print('[GR] LoRa demodulator ready on UDP:9090 -> forward to UDP:9091', flush=True)
 tb.run()
-""",
-        ]
-        import subprocess
-        gr_proc = subprocess.Popen(gr_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        time.sleep(0.5)
-    except Exception:
-        pass
+"""
+    try:
+        gr_proc = subprocess.Popen(
+            ["/opt/homebrew/opt/python@3.14/bin/python3.14", "-c", gr_script],
+            stdout=sys.stdout,
+            stderr=sys.stdout,  # merge stderr into stdout so we see GR errors
+        )
+        time.sleep(1.2)  # Wait for GR UDP server to bind
+    except Exception as exc:
+        print(f"[GR Error] {exc}", flush=True)
 
-    # Connect directly to PlutoSDR hardware
+    # -----------------------------------------------------------------------
+    # Connect PlutoSDR hardware
+    # -----------------------------------------------------------------------
     try:
         receiver.start_direct_sdr()
         receiver.start_udp_listener(port=9091)
-
-        # Transmit LoRa wake-up handshake beacon to Satellite
-        def send_ping():
-            import struct
-            try:
-                receiver.transmit_packet(bytes([0x01, 0x04]) + struct.pack("<I", serial_number))
-                time.sleep(0.05)
-                receiver.transmit_packet(bytes([0x0C, 0x01, 0x00]))
-            except Exception:
-                pass
-
-        print(f"[Pluto+ SDR TX] Transmitting wake-up beacon to Sat #{serial_number}...", flush=True)
-        send_ping()
     except Exception as exc:
         print(f"\n[PlutoSDR Error] {exc}", flush=True)
-        receiver.start_udp_listener(port=9091)
+        if gr_proc:
+            gr_proc.terminate()
+        return
+
+    # -----------------------------------------------------------------------
+    # Transmit wake-up beacon to satellite
+    # -----------------------------------------------------------------------
+    import struct
+
+    def send_ping() -> None:
+        try:
+            # Port 1: set satellite serial filter
+            receiver.transmit_packet(bytes([0x01, 0x04]) + struct.pack("<I", serial_number))
+            time.sleep(0.05)
+            # Port 12: OBC info request (triggers telemetry stream)
+            receiver.transmit_packet(bytes([0x0C, 0x01, 0x00]))
+        except Exception:
+            pass
+
+    print(f"[Pluto+ SDR TX] Transmitting wake-up beacon to Sat #{serial_number}...", flush=True)
+    send_ping()
 
     print(f"\nStreaming live telemetry from Sat #{serial_number} via PlutoSDR (Ctrl+C to stop)...\n", flush=True)
 
     try:
         last_ping = time.time()
+        last_count = 0
         while True:
-            time.sleep(1)
-            # Periodic keep-alive ping every 5 seconds if running
-            if time.time() - last_ping > 5.0:
+            time.sleep(5)
+            n = receiver.total_packets_received
+            if n > last_count:
+                print(f"[Stats] ✅ Received {n} packets total", flush=True)
+                last_count = n
+            else:
+                print(f"[Stats] ⏳ Waiting for packets... (total={n})", flush=True)
+            # Periodic keep-alive ping every 10 seconds
+            if time.time() - last_ping > 10.0:
+                print("[Pluto+ SDR TX] Sending keep-alive ping...", flush=True)
                 send_ping()
                 last_ping = time.time()
     except KeyboardInterrupt:
@@ -197,5 +210,3 @@ tb.run()
 
 if __name__ == "__main__":
     main()
-
-
