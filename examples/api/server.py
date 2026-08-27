@@ -37,6 +37,9 @@ from rascube_v2.exceptions import (
     RequestTimeoutError,
     SessionBusyError,
 )
+from rascube_v2.models.camera import CameraBlock
+from rascube_v2.protocol.camera import CameraAssembler
+
 
 # --- Global State ---
 class GroundStationState:
@@ -67,8 +70,10 @@ class GroundStationState:
         }
         self.latest_image: bytes | None = None
         self.latest_image_metadata: dict[str, Any] | None = None
+        self.camera_assembler = CameraAssembler()
         self.camera_lock = threading.Lock()
         self.camera_thread: threading.Thread | None = None
+
 
         # SSE Subscribers
         self.subscribers: list[queue.Queue[dict[str, Any]]] = []
@@ -178,10 +183,14 @@ def trigger_camera_capture(timeout: float = 30.0) -> None:
     with state.camera_lock:
         if state.camera_status == "capturing":
             raise SessionBusyError("A camera capture session is already in progress")
-        if not state.is_connected or state.cube is None:
-            raise ConnectionError("Receiver is not connected to a satellite. Connect first via /api/connect")
+        if not state.is_connected and not state.sdr_active and state.cube is None:
+            raise ConnectionError(
+                "Receiver is not connected to a satellite. Please connect via Client Web USB (Tab 1), "
+                "Server COM Port (Tab 2), or PlutoSDR (Tab 3) first."
+            )
 
         state.camera_status = "capturing"
+        state.camera_assembler.reset()
         state.camera_progress = {
             "blocks_received": 0,
             "total_bytes": 0,
@@ -193,24 +202,52 @@ def trigger_camera_capture(timeout: float = 30.0) -> None:
     def _worker() -> None:
         start_time = time.time()
         try:
-            def on_block(block: Any) -> None:
-                with state.lock:
-                    state.camera_progress["blocks_received"] += 1
-                    state.camera_progress["total_bytes"] += len(block.data)
-                    state.camera_progress["elapsed_seconds"] = round(time.time() - start_time, 2)
+            if state.cube is not None:
+                def on_block(block: Any) -> None:
+                    with state.lock:
+                        state.camera_progress["blocks_received"] += 1
+                        state.camera_progress["total_bytes"] += len(block.data)
+                        state.camera_progress["elapsed_seconds"] = round(time.time() - start_time, 2)
 
-            image = state.cube.camera.capture(timeout=timeout, on_block=on_block)
-            with state.lock:
-                state.latest_image = image.jpeg
-                state.latest_image_metadata = {
-                    "block_count": image.block_count,
-                    "duplicate_blocks": image.duplicate_blocks,
-                    "byte_length": len(image.jpeg),
-                    "captured_at": time.time(),
-                    "capture_duration_seconds": round(time.time() - start_time, 2),
-                }
-                state.camera_status = "completed"
-            print(f"[API Backend] Camera capture completed: {len(image.jpeg)} bytes in {time.time() - start_time:.2f}s")
+                image = state.cube.camera.capture(timeout=timeout, on_block=on_block)
+                with state.lock:
+                    state.latest_image = image.jpeg
+                    state.latest_image_metadata = {
+                        "block_count": image.block_count,
+                        "duplicate_blocks": image.duplicate_blocks,
+                        "byte_length": len(image.jpeg),
+                        "captured_at": time.time(),
+                        "capture_duration_seconds": round(time.time() - start_time, 2),
+                    }
+                    state.camera_status = "completed"
+                print(f"[API Backend] Camera capture completed: {len(image.jpeg)} bytes in {time.time() - start_time:.2f}s")
+            elif state.sdr_active:
+                # Transmit camera capture trigger over PlutoSDR RF (HostPort.OBC_CAMERA = 0x13)
+                print(f"[API SDR] Sending camera capture trigger to Satellite #{state.sdr_sat}...")
+                transmit_sdr_command(
+                    sat=state.sdr_sat,
+                    cmd_type="raw_hex",
+                    params={"hex": "130100"},
+                    bw=state.sdr_bw,
+                    sdr_uri=state.sdr_uri,
+                )
+                # Wait for camera blocks to be received and assembled in SDR background receiver loop
+                while time.time() - start_time < timeout:
+                    with state.camera_lock:
+                        if state.camera_status == "completed":
+                            print(f"[API SDR] Camera capture completed: {len(state.latest_image or b'')} bytes")
+                            return
+                        if state.camera_status == "failed":
+                            return
+                    time.sleep(0.2)
+
+                with state.camera_lock:
+                    if state.camera_status == "capturing":
+                        state.camera_status = "failed"
+                        state.camera_progress["error"] = f"Camera capture timed out after {timeout:.1f}s"
+            else:
+                raise ConnectionError("No active satellite connection to trigger camera")
+
         except Exception as exc:
             print(f"[API Backend] Camera capture error: {exc}")
             with state.lock:
@@ -220,6 +257,7 @@ def trigger_camera_capture(timeout: float = 30.0) -> None:
     t = threading.Thread(target=_worker, daemon=True, name="camera-worker")
     state.camera_thread = t
     t.start()
+
 
 
 def background_sdr_receiver_loop(
@@ -350,35 +388,69 @@ def background_sdr_receiver_loop(
                             data_bytes.append((unwhitened[i] << 4) | unwhitened[i + 1])
                         decoded = bytes(data_bytes)
 
-                        if decoded and len(decoded) >= 20:
-                            p_sig = float(
-                                np.mean(np.abs(iq_proc[payload_start : payload_start + 1024]) ** 2) + 1e-12
-                            )
-                            meas_rssi = float(-100.0 + 10.0 * np.log10(p_sig * 1000.0))
-                            meas_snr = float(np.mean(snrs))
+                        if decoded and len(decoded) >= 2:
+                            port = decoded[0]
 
-                            payload_113 = decoded[:113].ljust(113, b"\x00")
-                            rssi_bytes = struct.pack("<f", meas_rssi)
-                            snr_bytes = struct.pack("<f", meas_snr)
-                            rascube_pkt = bytes([0x10, 0x79]) + payload_113 + rssi_bytes + snr_bytes
+                            # 1. Camera Block Packet (InboundPort.JPEG_CAMERA = 0x20)
+                            if port == 0x20:
+                                raw_payload = decoded[2:] if len(decoded) > 2 else decoded
+                                if len(raw_payload) >= 2:
+                                    blk_idx = struct.unpack_from("<H", raw_payload, 0)[0]
+                                    blk_data = raw_payload[2:]
+                                    block = CameraBlock(index=blk_idx, data=blk_data, metadata=None)
+                                    with state.camera_lock:
+                                        if state.camera_status == "capturing":
+                                            try:
+                                                jpeg_res = state.camera_assembler.add(block)
+                                                state.camera_progress["blocks_received"] += 1
+                                                state.camera_progress["total_bytes"] += len(blk_data)
+                                                started_at = state.camera_progress.get("started_at") or time.time()
+                                                state.camera_progress["elapsed_seconds"] = round(time.time() - started_at, 2)
+                                                if jpeg_res is not None:
+                                                    state.latest_image = jpeg_res
+                                                    state.latest_image_metadata = {
+                                                        "block_count": state.camera_assembler.block_count,
+                                                        "duplicate_blocks": len(state.camera_assembler.duplicates),
+                                                        "byte_length": len(jpeg_res),
+                                                        "captured_at": time.time(),
+                                                        "capture_duration_seconds": state.camera_progress["elapsed_seconds"],
+                                                    }
+                                                    state.camera_status = "completed"
+                                                    print(f"[API SDR] Camera JPEG complete: {len(jpeg_res)} bytes ({state.camera_assembler.block_count} blocks)")
+                                            except Exception as err:
+                                                print(f"[API SDR] Camera assembly error: {err}")
 
-                            with state.lock:
-                                state.sdr_packets_count += 1
-                                state.sdr_last_rssi = meas_rssi
-                                state.sdr_last_snr = meas_snr
+                            # 2. Main Telemetry Packet (InboundPort.MAIN_TELEMETRY = 0x10 or raw payload)
+                            elif len(decoded) >= 20:
+                                p_sig = float(
+                                    np.mean(np.abs(iq_proc[payload_start : payload_start + 1024]) ** 2) + 1e-12
+                                )
+                                meas_rssi = float(-100.0 + 10.0 * np.log10(p_sig * 1000.0))
+                                meas_snr = float(np.mean(snrs))
 
-                            try:
-                                t_dict = decode_telemetry_to_dict(rascube_pkt)
-                                t_dict["raw_hex"] = rascube_pkt.hex().upper()
-                                t_dict["timestamp"] = time.time()
-                                t_dict["source"] = "PlutoSDR"
-                                state.broadcast_telemetry(t_dict)
-                            except Exception:
-                                pass
+                                payload_113 = decoded[:113].ljust(113, b"\x00")
+                                rssi_bytes = struct.pack("<f", meas_rssi)
+                                snr_bytes = struct.pack("<f", meas_snr)
+                                rascube_pkt = bytes([0x10, 0x79]) + payload_113 + rssi_bytes + snr_bytes
+
+                                with state.lock:
+                                    state.sdr_packets_count += 1
+                                    state.sdr_last_rssi = meas_rssi
+                                    state.sdr_last_snr = meas_snr
+
+                                try:
+                                    t_dict = decode_telemetry_to_dict(rascube_pkt)
+                                    t_dict["raw_hex"] = rascube_pkt.hex().upper()
+                                    t_dict["timestamp"] = time.time()
+                                    t_dict["source"] = "PlutoSDR"
+                                    state.broadcast_telemetry(t_dict)
+                                except Exception:
+                                    pass
 
                         idx += 200
                     else:
                         idx += 1
+
 
     except Exception as exc:
         print(f"[API SDR] PlutoSDR error: {exc}")
