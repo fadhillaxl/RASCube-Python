@@ -20,6 +20,7 @@ import subprocess
 import sys
 import time
 
+sys.path.insert(0, "src")
 from rascube_v2.models.obc import FirmwareInfo, ObcInfo
 from rascube_v2.models.receiver import ReceiverInfo
 from rascube_v2.models.telemetry import MainTelemetrySample
@@ -36,6 +37,7 @@ def main() -> None:
     parser.add_argument("--sf", type=int, default=7, help="LoRa Spreading Factor (default: 7)")
     parser.add_argument("--bw", type=int, default=500_000, help="LoRa Bandwidth in Hz (default: 500000)")
     parser.add_argument("--hex", action="store_true", help="Print raw HEX telemetry packets instead of metrics")
+    parser.add_argument("--tx-ping", action="store_true", help="Transmit periodic wake-up beacon via SDR TX")
 
     args = parser.parse_args()
 
@@ -121,7 +123,7 @@ class FrameForwarder(gr.sync_block):
             print(f'[GR] Forward error: {{exc}}', flush=True)
 
 tb = gr.top_block('LoRaRX')
-src = network.udp_source(8, 1, 9090, 0, 1472, False, False, False)
+src = network.udp_source(8, "127.0.0.1", 9090, 8*1024*1024, 1472, False, False, False)
 rx = lora_sdr_lora_rx(
     center_freq={freq_hz},
     bw={args.bw},
@@ -132,8 +134,8 @@ rx = lora_sdr_lora_rx(
     samp_rate=1000000,
     sf={args.sf},
     sync_word=[0x12],
-    soft_decoding=True,
-    ldro_mode=0,
+    soft_decoding=False,
+    ldro_mode=2,
     print_rx=[True, True],
 )
 fwd = FrameForwarder()
@@ -167,23 +169,9 @@ tb.run()
             gr_proc.terminate()
         return
 
-    # -----------------------------------------------------------------------
-    # Transmit wake-up beacon to satellite
-    # -----------------------------------------------------------------------
-    import struct
-
-    def send_ping() -> None:
-        try:
-            # Port 1: set satellite serial filter
-            receiver.transmit_packet(bytes([0x01, 0x04]) + struct.pack("<I", serial_number))
-            time.sleep(0.05)
-            # Port 12: OBC info request (triggers telemetry stream)
-            receiver.transmit_packet(bytes([0x0C, 0x01, 0x00]))
-        except Exception:
-            pass
-
-    print(f"[Pluto+ SDR TX] Transmitting wake-up beacon to Sat #{serial_number}...", flush=True)
-    send_ping()
+    if args.tx_ping:
+        print(f"[Pluto+ SDR TX] Beacon mode enabled (Sat #{serial_number})...", flush=True)
+        receiver.transmit_packet(bytes([0x12, 0x01, 0x00]))
 
     print(f"\nStreaming live telemetry from Sat #{serial_number} via PlutoSDR (Ctrl+C to stop)...\n", flush=True)
 
@@ -191,17 +179,13 @@ tb.run()
         last_ping = time.time()
         last_count = 0
         while True:
-            time.sleep(5)
+            time.sleep(3)
             n = receiver.total_packets_received
             if n > last_count:
                 print(f"[Stats] ✅ Received {n} packets total", flush=True)
                 last_count = n
-            else:
-                print(f"[Stats] ⏳ Waiting for packets... (total={n})", flush=True)
-            # Periodic keep-alive ping every 10 seconds
-            if time.time() - last_ping > 10.0:
-                print("[Pluto+ SDR TX] Sending keep-alive ping...", flush=True)
-                send_ping()
+            if args.tx_ping and time.time() - last_ping > 10.0:
+                receiver.transmit_packet(bytes([0x12, 0x01, 0x00]))
                 last_ping = time.time()
     except KeyboardInterrupt:
         print("\nStopping PlutoSDR receiver...", flush=True)
@@ -213,3 +197,4 @@ tb.run()
 
 if __name__ == "__main__":
     main()
+

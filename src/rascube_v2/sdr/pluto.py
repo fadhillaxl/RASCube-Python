@@ -147,7 +147,7 @@ class PlutoSDRReceiver:
         """Continuous background thread streaming Pluto+ SDR raw I/Q samples to GNU Radio via UDP."""
         udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         try:
-            udp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4 * 1024 * 1024)
+            udp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 8 * 1024 * 1024)
         except Exception:
             pass
         CHUNK = 1472  # bytes per UDP datagram = 184 complex64 samples
@@ -155,17 +155,12 @@ class PlutoSDRReceiver:
             try:
                 iq_data = self._sdr_device.rx()
                 if iq_data is None or len(iq_data) == 0:
-                    time.sleep(0.002)
+                    time.sleep(0.001)
                     continue
 
-                # Normalize: PlutoSDR returns raw int16 ADC counts (±2048 for 12-bit ADC)
-                # gr-lora_sdr expects normalized complex64 (≈ ±1.0 range)
-                try:
-                    raw_c64 = (iq_data.astype(np.complex64) / 2048.0).tobytes()
-                    for i in range(0, len(raw_c64), CHUNK):
-                        udp_sock.sendto(raw_c64[i : i + CHUNK], ("127.0.0.1", 9090))
-                except Exception:
-                    pass
+                raw_c64 = (iq_data.astype(np.complex64) / 2048.0).tobytes()
+                for i in range(0, len(raw_c64), CHUNK):
+                    udp_sock.sendto(raw_c64[i : i + CHUNK], ("127.0.0.1", 9090))
 
             except Exception:
                 if self._running:
