@@ -1699,7 +1699,7 @@ HTML_DASHBOARD = """<!DOCTYPE html>
     async function triggerCameraCapture() {
       const btn = document.getElementById('btnCameraCapture');
       btn.disabled = true;
-      btn.innerText = '⏳ Requesting...';
+      btn.innerText = '⏳ Triggering...';
 
       // Reset chunks visualizer
       receivedChunks.clear();
@@ -1718,7 +1718,7 @@ HTML_DASHBOARD = """<!DOCTYPE html>
           writer.releaseLock();
 
           // Inform backend of client web serial capture session
-          fetch('/api/camera/capture', {
+          await fetch('/api/camera/capture', {
             method: 'POST',
             headers: {'Content-Type': 'application/json'},
             body: JSON.stringify({ timeout: 35.0, source: 'client_web_serial' })
@@ -1726,6 +1726,7 @@ HTML_DASHBOARD = """<!DOCTYPE html>
 
           document.getElementById('cameraProgressContainer').style.display = 'block';
           document.getElementById('cameraStatusText').innerText = 'Status: Capturing via Web USB...';
+          btn.innerText = '📸 Capturing (Web USB)...';
           if (cameraPollingInterval) clearInterval(cameraPollingInterval);
           cameraPollingInterval = setInterval(pollCameraStatus, 800);
           return;
@@ -1745,6 +1746,7 @@ HTML_DASHBOARD = """<!DOCTYPE html>
         }
         document.getElementById('cameraProgressContainer').style.display = 'block';
         document.getElementById('cameraStatusText').innerText = 'Status: Capturing image...';
+        btn.innerText = '📸 Capturing...';
         if (cameraPollingInterval) clearInterval(cameraPollingInterval);
         cameraPollingInterval = setInterval(pollCameraStatus, 800);
       } catch (err) {
@@ -1902,67 +1904,54 @@ HTML_DASHBOARD = """<!DOCTYPE html>
           while (true) {
             const { value, done } = await clientReader.read();
             if (done) break;
-            if (value) {
+            if (value && value.length > 0) {
               const merged = new Uint8Array(buffer.length + value.length);
               merged.set(buffer);
               merged.set(value, buffer.length);
               buffer = merged;
 
-              // Parse frames in buffer
+              // Parse frames according to standard RASCube framing: [port, len, payload...]
               while (buffer.length >= 2) {
-                // 1. Port 0x10 Telemetry (123 bytes: 0x10, 0x79)
-                if (buffer[0] === 0x10 && buffer[1] === 0x79) {
-                  if (buffer.length < 123) break;
-                  const frame = buffer.slice(0, 123);
-                  buffer = buffer.slice(123);
-                  const hex = Array.from(frame).map(b => b.toString(16).padStart(2, '0')).join('').toUpperCase();
-                  fetch('/api/telemetry/ingest', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ hex, source: 'client_web_serial' })
-                  })
-                  .then(r => r.json())
-                  .then(res => { if (res.telemetry) renderTelemetry(res.telemetry); })
-                  .catch(console.error);
-                  continue;
-                }
+                const port = buffer[0];
+                const len = buffer[1];
+                const frameLen = 2 + len;
 
-                // 2. Port 0x20 Camera Block (244 bytes: 0x20, 0xF2)
-                if (buffer[0] === 0x20 && buffer[1] === 0xF2) {
-                  if (buffer.length < 244) break;
-                  const frame = buffer.slice(0, 244);
-                  buffer = buffer.slice(244);
-                  const hex = Array.from(frame).map(b => b.toString(16).padStart(2, '0')).join('').toUpperCase();
-                  fetch('/api/camera/chunk/ingest', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ hex, source: 'client_web_serial' })
-                  })
-                  .then(r => r.json())
-                  .then(res => { if (res.chunk) renderCameraChunk(res.chunk); })
-                  .catch(console.error);
-                  continue;
-                }
-
-                // Search next header candidate if current byte is not a known header
-                let nextHeaderIdx = -1;
-                for (let i = 1; i < buffer.length; i++) {
-                  if ((buffer[i] === 0x10 && buffer[i+1] === 0x79) || (buffer[i] === 0x20 && buffer[i+1] === 0xF2)) {
-                    nextHeaderIdx = i;
+                if (port === 0x10 || port === 0x20 || port === 0x01 || port === 0x13 || port === 0x02 || port === 0x03) {
+                  if (buffer.length < frameLen) {
                     break;
                   }
-                }
-                if (nextHeaderIdx !== -1) {
-                  buffer = buffer.slice(nextHeaderIdx);
+
+                  const frame = buffer.slice(0, frameLen);
+                  buffer = buffer.slice(frameLen);
+                  const hex = Array.from(frame).map(b => b.toString(16).padStart(2, '0')).join('').toUpperCase();
+
+                  if (port === 0x10) {
+                    fetch('/api/telemetry/ingest', {
+                      method: 'POST',
+                      headers: { 'Content-Type': 'application/json' },
+                      body: JSON.stringify({ hex, source: 'client_web_serial' })
+                    })
+                    .then(r => r.json())
+                    .then(res => { if (res.telemetry) renderTelemetry(res.telemetry); })
+                    .catch(console.error);
+                  } else if (port === 0x20) {
+                    fetch('/api/camera/chunk/ingest', {
+                      method: 'POST',
+                      headers: { 'Content-Type': 'application/json' },
+                      body: JSON.stringify({ hex, source: 'client_web_serial' })
+                    })
+                    .then(r => r.json())
+                    .then(res => { if (res.chunk) renderCameraChunk(res.chunk); })
+                    .catch(console.error);
+                  }
                 } else {
-                  buffer = buffer.slice(-2);
-                  break;
+                  buffer = buffer.slice(1);
                 }
               }
             }
           }
         } catch (e) {
-          console.warn('Web Serial stream error:', e);
+          if (isClientConnected) console.warn('Web Serial stream error:', e);
           break;
         } finally {
           if (clientReader) {
@@ -2072,6 +2061,21 @@ HTML_DASHBOARD = """<!DOCTYPE html>
 
 
 class GroundStationAPIHandler(BaseHTTPRequestHandler):
+    def handle_one_request(self) -> None:
+        try:
+            super().handle_one_request()
+        except (ConnectionResetError, BrokenPipeError):
+            self.close_connection = True
+        except Exception as exc:
+            self.close_connection = True
+
+    def log_error(self, format: str, *args: Any) -> None:
+        # Ignore ConnectionResetError / BrokenPipeError in standard HTTP logger
+        msg = format % args
+        if "Connection reset by peer" in msg or "Broken pipe" in msg:
+            return
+        super().log_error(format, *args)
+
     def _send_json(self, status: int, data: Any) -> None:
         def _json_default(obj: Any) -> Any:
             if isinstance(obj, (set, frozenset)):
