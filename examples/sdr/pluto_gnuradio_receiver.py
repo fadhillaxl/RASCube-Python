@@ -19,6 +19,20 @@ import os
 import sys
 import time
 
+# Ensure workspace src/ directory and .venv packages are included in sys.path
+WORKSPACE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+WORKSPACE_SRC = os.path.join(WORKSPACE_DIR, "src")
+if WORKSPACE_SRC not in sys.path:
+    sys.path.insert(0, WORKSPACE_SRC)
+
+# Include venv site-packages if running from system python
+for venv_site in [
+    os.path.join(WORKSPACE_DIR, ".venv", "lib", f"python{v}", "site-packages")
+    for v in ["3.12", "3.13", "3.14", "3.11"]
+]:
+    if os.path.exists(venv_site) and venv_site not in sys.path:
+        sys.path.insert(0, venv_site)
+
 # Ensure Homebrew GNU Radio Python paths are included
 for p in [
     "/opt/homebrew/lib/python3.14/site-packages",
@@ -29,7 +43,8 @@ for p in [
         sys.path.insert(0, p)
 
 from rascube_v2.decoder import decode_main_telemetry_hex
-from rascube_v2.models.firmware import FirmwareInfo, ObcInfo, ReceiverInfo
+from rascube_v2.models.obc import FirmwareInfo, ObcInfo
+from rascube_v2.models.receiver import ReceiverInfo
 
 
 def main() -> None:
@@ -64,13 +79,33 @@ def main() -> None:
     print(f"📋 Output Format    : {'Raw HEX Packets' if args.hex else 'Uptime, Lat, Lon'}")
     print("=" * 65)
 
-    try:
-        from gnuradio import blocks, gr, iio
-        from gnuradio.lora_sdr import lora_sdr_lora_rx
-    except ImportError as exc:
-        print(f"\n[Error loading GNU Radio / gr-lora_sdr] {exc}")
-        print("Please run with GNU Radio Python environment: python3.14 examples/sdr/pluto_gnuradio_receiver.py")
-        sys.exit(1)
+    import pmt
+    from gnuradio import blocks, gr, iio
+    from gnuradio.lora_sdr import lora_sdr_lora_rx
+
+    class TelemetryHandlerBlock(gr.sync_block):
+        def __init__(self, is_hex: bool) -> None:
+            super().__init__(name="TelemetryHandler", in_sig=None, out_sig=None)
+            self.is_hex = is_hex
+            self.message_port_register_in(pmt.intern("in"))
+            self.set_msg_handler(pmt.intern("in"), self.handle_msg)
+
+        def handle_msg(self, msg: Any) -> None:
+            try:
+                data_pmt = pmt.cdr(msg) if pmt.is_pair(msg) else msg
+                raw_bytes = bytes(pmt.u8vector_elements(data_pmt))
+                if len(raw_bytes) == 121:
+                    full_packet = bytes([0x10, 0x79]) + raw_bytes
+                else:
+                    full_packet = raw_bytes
+
+                if self.is_hex:
+                    print(full_packet.hex().upper())
+                else:
+                    sample = decode_main_telemetry_hex(full_packet)
+                    print(f"{sample.device_uptime_ms} {sample.gps.latitude} {sample.gps.longitude}")
+            except Exception:
+                pass
 
     class PlutoLoRaFlowgraph(gr.top_block):
         def __init__(self) -> None:
@@ -95,15 +130,19 @@ def main() -> None:
                 impl_head=False,
                 ldo=False,
                 pay_len=121,
-                print_rx=[True],
+                print_rx=[False],
                 samp_rate=1_000_000,
                 sf=int(args.sf),
                 soft_decoding=True,
                 sync_word=[0x34],
             )
 
-            # 3. Connect Blocks
+            # 3. Custom Output Handler
+            self.handler = TelemetryHandlerBlock(is_hex=args.hex)
+
+            # Connect Blocks
             self.connect((self.sdr_source, 0), (self.lora_rx, 0))
+            self.msg_connect((self.lora_rx, "out"), (self.handler, "in"))
 
     tb = PlutoLoRaFlowgraph()
     tb.start()
@@ -123,3 +162,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
