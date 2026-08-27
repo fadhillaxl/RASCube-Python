@@ -21,62 +21,73 @@ from rascube_v2.decoder import decode_main_telemetry_hex
 from rascube_v2.models.telemetry import MainTelemetrySample
 
 
-WHITENING_SEQ = [
-    0xFF, 0xFE, 0xFC, 0xF8, 0xF0, 0xE1, 0xC2, 0x85, 0x0B, 0x17, 0x2F, 0x5E, 0xBC, 0x78, 0xF1, 0xE3,
-    0xC6, 0x8D, 0x1B, 0x37, 0x6E, 0xDC, 0xB8, 0x71, 0xE2, 0xC4, 0x89, 0x13, 0x27, 0x4E, 0x9C, 0x38,
-    0x70, 0xE0, 0xC0, 0x81, 0x03, 0x07, 0x0F, 0x1F, 0x3F, 0x7E, 0xFC, 0xF8, 0xF1, 0xE3, 0xC7, 0x8F,
-    0x1F, 0x3E, 0x7C, 0xF8, 0xF0, 0xE1, 0xC2, 0x84, 0x09, 0x13, 0x26, 0x4C, 0x98, 0x30, 0x60, 0xC0,
-    0x80, 0x01, 0x02, 0x04, 0x08, 0x11, 0x23, 0x47, 0x8E, 0x1D, 0x3B, 0x76, 0xEC, 0xD8, 0xB1, 0x62,
-    0xC5, 0x8B, 0x17, 0x2E, 0x5C, 0xB8, 0x70, 0xE1, 0xC2, 0x85, 0x0A, 0x15, 0x2B, 0x56, 0xAC, 0x58,
-    0xB0, 0x61, 0xC3, 0x87, 0x0F, 0x1E, 0x3C, 0x78, 0xF0, 0xE0, 0xC1, 0x83, 0x07, 0x0E, 0x1C, 0x38,
-    0x71, 0xE3, 0xC6, 0x8C, 0x19, 0x33, 0x66, 0xCC, 0x98, 0x31, 0x62, 0xC4, 0x88, 0x10, 0x21, 0x43,
-    0x86, 0x0D, 0x1B, 0x36, 0x6C, 0xD9, 0xB3, 0x66, 0xCD, 0x9A, 0x34, 0x69, 0xD3, 0xA7, 0x4E, 0x9D,
-    0x3A, 0x74, 0xE8, 0xD0, 0xA1, 0x42, 0x85, 0x0B, 0x16, 0x2D, 0x5A, 0xB4, 0x68, 0xD1, 0xA3, 0x46,
-    0x8C, 0x18, 0x31, 0x63, 0xC6, 0x8D, 0x1A, 0x35, 0x6A, 0xD5, 0xAB, 0x56, 0xAD, 0x5A, 0xB5, 0x6A,
-    0xD4, 0xA9, 0x52, 0xA4, 0x48, 0x91, 0x23, 0x46, 0x8D, 0x1B, 0x36, 0x6D, 0xDA, 0xB5, 0x6B, 0xD6,
-    0xAC, 0x59, 0xB2, 0x64, 0xC9, 0x93, 0x27, 0x4F, 0x9E, 0x3C, 0x79, 0xF2, 0xE5, 0xCB, 0x97, 0x2E,
-    0x5D, 0xBA, 0x75, 0xEB, 0xD6, 0xAD, 0x5B, 0xB6, 0x6C, 0xD8, 0xB0, 0x60, 0xC1, 0x82, 0x05, 0x0B,
-    0x17, 0x2E, 0x5D, 0xBB, 0x76, 0xED, 0xDA, 0xB4, 0x69, 0xD2, 0xA5, 0x4A, 0x95, 0x2B, 0x57, 0xAE,
-    0x5C, 0xB9, 0x72, 0xE4, 0xC9, 0x92, 0x25, 0x4B, 0x97, 0x2F, 0x5E, 0xBD, 0x7A, 0xF5, 0xEB, 0xD7
+# Exact Semtech SX1262 Galois PN9 LFSR sequence (512 nibbles = 256 bytes)
+LFSR_NIBBLES = [
+    15, 15, 14, 15, 12, 15, 8, 15, 0, 15, 1, 14, 2, 12, 5, 8, 11, 0, 7, 1, 15, 2, 14, 5, 12, 11, 8, 7, 1, 15, 3, 14,
+    6, 12, 13, 8, 10, 1, 4, 3, 8, 6, 0, 13, 0, 10, 0, 4, 0, 8, 1, 0, 2, 0, 4, 0, 8, 0, 1, 1, 3, 2, 7, 4,
+    14, 8, 13, 1, 11, 2, 6, 5, 13, 11, 10, 6, 4, 13, 9, 10, 3, 5, 6, 11, 12, 6, 9, 13, 2, 11, 5, 6, 10, 13, 5, 10,
+    11, 5, 6, 10, 12, 5, 9, 10, 3, 5, 7, 10, 14, 4, 13, 9, 11, 2, 7, 5, 14, 11, 13, 6, 10, 13, 4, 11, 9, 6, 2, 13,
+    5, 11, 11, 6, 6, 12, 13, 9, 10, 3, 4, 7, 9, 14, 2, 13, 4, 11, 8, 6, 1, 13, 2, 11, 5, 6, 10, 13, 4, 10, 9, 5,
+    3, 10, 6, 5, 13, 10, 10, 5, 5, 10, 11, 5, 7, 10, 14, 5, 13, 10, 11, 5, 6, 10, 13, 5, 10, 11, 4, 6, 9, 13, 3, 10,
+    6, 5, 12, 11, 9, 6, 3, 13, 6, 11, 12, 6, 8, 13, 1, 11, 3, 6, 6, 13, 13, 10, 11, 4, 6, 8, 13, 0, 10, 0, 5, 0,
+    10, 0, 5, 1, 10, 2, 4, 5, 9, 10, 3, 4, 6, 9, 12, 2, 9, 4, 3, 9, 6, 2, 13, 4, 11, 9, 6, 2, 13, 5, 11, 10, 6,
+    5, 13, 11, 10, 6, 4, 13, 9, 10, 3, 4, 7, 9, 15, 2, 14, 5, 13, 10, 10, 5, 4, 11, 9, 6, 3, 13, 7, 10, 14, 5, 13,
+    11, 10, 6, 5, 13, 10, 10, 5, 4, 10, 8, 5, 1, 10, 3, 4, 6, 9, 13, 2, 10, 5, 5, 10, 10, 5, 4, 10, 8, 4, 0, 9,
+    0, 2, 0, 5, 0, 10, 1, 5, 2, 10, 4, 5, 8, 11, 0, 6, 0, 13, 1, 10, 2, 5, 4, 10, 8, 5, 0, 11, 1, 6, 2, 13,
+    4, 10, 9, 4, 3, 9, 7, 2, 14, 5, 13, 10, 10, 5, 5, 11, 11, 6, 6, 13, 12, 10, 9, 4, 2, 9, 5, 2, 11, 5, 6, 10,
+    12, 5, 8, 11, 1, 6, 3, 12, 7, 9, 14, 2, 13, 5, 10, 11, 4, 6, 9, 12, 2, 9, 5, 2, 10, 5, 5, 11, 10, 6, 4, 12,
+    9, 9, 2, 2, 5, 5, 10, 10, 5, 4, 10, 9, 4, 2, 9, 5, 3, 10, 6, 4, 12, 9, 8, 3, 0, 6, 0, 12, 1, 9, 2, 2,
+    4, 5, 8, 10, 1, 5, 3, 10, 6, 5, 12, 11, 8, 6, 0, 13, 1, 10, 3, 5, 7, 10, 14, 4, 12, 9, 9, 2, 3, 5, 6, 10,
+    13, 5, 10, 10, 4, 5, 9, 10, 2, 5, 5, 10, 11, 5, 6, 10, 13, 5, 10, 11, 4, 6, 8, 12, 1, 9, 3, 3, 6, 6, 12, 12
 ]
 
 
-def dewhiten(data: bytearray | bytes) -> bytes:
-    return bytes(b ^ WHITENING_SEQ[i % len(WHITENING_SEQ)] for i, b in enumerate(data))
+def dewhiten_nibbles(nibbles: list[int]) -> list[int]:
+    """Semtech SX1262 PN9 Galois LFSR dewhitener."""
+    return [n ^ LFSR_NIBBLES[i % len(LFSR_NIBBLES)] for i, n in enumerate(nibbles)]
+
+
+def decode_hamming_5_4(codeword: int) -> int:
+    """Decode Hamming(5,4): 4 data bits + 1 parity bit."""
+    d0 = codeword & 1
+    d1 = (codeword >> 1) & 1
+    d2 = (codeword >> 2) & 1
+    d3 = (codeword >> 3) & 1
+    return (d3 << 3) | (d2 << 2) | (d1 << 1) | d0
 
 
 def decode_lora_frame(symbols: list[int], sf: int = 7, cr: int = 1) -> bytes | None:
-    """Demaps, deinterleaves, and dewhitens a stream of LoRa symbols."""
-    gray_demapped = []
-    for s in symbols:
-        val = s
-        shift = 1
-        while shift < sf:
-            val ^= (val >> shift)
-            shift <<= 1
-        gray_demapped.append(val)
+    """Semtech SX1262 DSP Demapper, Diagonal Deinterleaver, and Galois PN9 Dewhitener."""
+    if len(symbols) < 10:
+        return None
 
+    # 1. Gray Mapping: codeword = (sym ^ (sym >> 1))
+    mapped = [(s ^ (s >> 1)) for s in symbols]
+
+    # 2. Diagonal Deinterleaving (CR=4/5 -> cw_len=5)
     cw_len = 4 + cr
-    n_blocks = len(gray_demapped) // cw_len
+    n_blocks = len(mapped) // cw_len
     nibbles = []
 
     for blk in range(n_blocks):
-        block_syms = gray_demapped[blk * cw_len : (blk + 1) * cw_len]
+        block_syms = mapped[blk * cw_len : (blk + 1) * cw_len]
         for bit in range(sf):
             codeword = 0
             for i in range(cw_len):
                 shift = (bit + i) % sf
                 b = (block_syms[i] >> shift) & 1
                 codeword |= (b << i)
-            data_nibble = codeword & 0x0F
-            nibbles.append(data_nibble)
+            nibbles.append(decode_hamming_5_4(codeword))
 
-    raw_bytes = bytearray()
-    for i in range(0, len(nibbles) - 1, 2):
-        byte_val = (nibbles[i + 1] << 4) | nibbles[i]
-        raw_bytes.append(byte_val)
+    # 3. Dewhiten using Semtech SX1262 Galois LFSR
+    unwhitened = dewhiten_nibbles(nibbles)
 
-    return dewhiten(raw_bytes)
+    # 4. Pack nibbles into bytes
+    data_bytes = bytearray()
+    for i in range(0, len(unwhitened) - 1, 2):
+        data_bytes.append((unwhitened[i] << 4) | unwhitened[i + 1])
+
+    return bytes(data_bytes)
 
 
 def verify_lora_crc16(data: bytes, received_crc: int) -> bool:
