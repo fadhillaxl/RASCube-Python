@@ -214,7 +214,7 @@ def trigger_camera_capture(timeout: float = 30.0) -> None:
                     state.latest_image = image.jpeg
                     state.latest_image_metadata = {
                         "block_count": image.block_count,
-                        "duplicate_blocks": image.duplicate_blocks,
+                        "duplicate_blocks": len(image.duplicate_blocks),
                         "byte_length": len(image.jpeg),
                         "captured_at": time.time(),
                         "capture_duration_seconds": round(time.time() - start_time, 2),
@@ -1788,7 +1788,18 @@ HTML_DASHBOARD = """<!DOCTYPE html>
 
 class GroundStationAPIHandler(BaseHTTPRequestHandler):
     def _send_json(self, status: int, data: Any) -> None:
-        body = json.dumps(data, indent=2).encode("utf-8")
+        def _json_default(obj: Any) -> Any:
+            if isinstance(obj, (set, frozenset)):
+                return list(obj)
+            if dataclasses.is_dataclass(obj):
+                return dataclasses.asdict(obj)
+            if hasattr(obj, "isoformat"):
+                return obj.isoformat()
+            if isinstance(obj, bytes):
+                return obj.hex().upper()
+            return str(obj)
+
+        body = json.dumps(data, indent=2, default=_json_default).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
