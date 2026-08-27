@@ -70,6 +70,7 @@ class GroundStationState:
         }
         self.latest_image: bytes | None = None
         self.latest_image_metadata: dict[str, Any] | None = None
+        self.camera_chunks: list[dict[str, Any]] = []
         self.camera_assembler = CameraAssembler()
         self.camera_lock = threading.Lock()
         self.camera_thread: threading.Thread | None = None
@@ -121,6 +122,16 @@ class GroundStationState:
                 q.put_nowait(data)
             except queue.Full:
                 pass
+
+    def broadcast_camera_chunk(self, chunk: dict[str, Any]) -> None:
+        with self.lock:
+            subs = list(self.subscribers)
+        for q in subs:
+            try:
+                q.put_nowait(chunk)
+            except queue.Full:
+                pass
+
 
 
 state = GroundStationState()
@@ -191,11 +202,14 @@ def trigger_camera_capture(timeout: float = 30.0) -> None:
 
         state.camera_status = "capturing"
         state.camera_assembler.reset()
+        state.camera_chunks.clear()
         state.camera_progress = {
             "blocks_received": 0,
             "total_bytes": 0,
             "started_at": time.time(),
             "elapsed_seconds": 0.0,
+            "transfer_speed_bps": 0.0,
+            "latest_block_index": 0,
             "error": None,
         }
 
@@ -204,10 +218,29 @@ def trigger_camera_capture(timeout: float = 30.0) -> None:
         try:
             if state.cube is not None:
                 def on_block(block: Any) -> None:
+                    now = time.time()
+                    elapsed = round(now - start_time, 2)
                     with state.lock:
                         state.camera_progress["blocks_received"] += 1
                         state.camera_progress["total_bytes"] += len(block.data)
-                        state.camera_progress["elapsed_seconds"] = round(time.time() - start_time, 2)
+                        state.camera_progress["elapsed_seconds"] = elapsed
+                        state.camera_progress["latest_block_index"] = block.index
+                        speed = round(state.camera_progress["total_bytes"] / max(0.01, elapsed), 1)
+                        state.camera_progress["transfer_speed_bps"] = speed
+
+                        chunk_record = {
+                            "type": "camera_chunk",
+                            "index": block.index,
+                            "size": len(block.data),
+                            "total_blocks": state.camera_progress["blocks_received"],
+                            "total_bytes": state.camera_progress["total_bytes"],
+                            "elapsed_seconds": elapsed,
+                            "hex_preview": block.data[:16].hex().upper(),
+                            "timestamp": now,
+                        }
+                        state.camera_chunks.append(chunk_record)
+
+                    state.broadcast_camera_chunk(chunk_record)
 
                 image = state.cube.camera.capture(timeout=timeout, on_block=on_block)
                 with state.lock:
@@ -221,6 +254,7 @@ def trigger_camera_capture(timeout: float = 30.0) -> None:
                     }
                     state.camera_status = "completed"
                 print(f"[API Backend] Camera capture completed: {len(image.jpeg)} bytes in {time.time() - start_time:.2f}s")
+
             elif state.sdr_active:
                 # Transmit camera capture trigger over PlutoSDR RF (HostPort.OBC_CAMERA = 0x13)
                 print(f"[API SDR] Sending camera capture trigger to Satellite #{state.sdr_sat}...")
@@ -402,10 +436,31 @@ def background_sdr_receiver_loop(
                                         if state.camera_status == "capturing":
                                             try:
                                                 jpeg_res = state.camera_assembler.add(block)
+                                                now = time.time()
+                                                started_at = state.camera_progress.get("started_at") or now
+                                                elapsed = round(now - started_at, 2)
                                                 state.camera_progress["blocks_received"] += 1
                                                 state.camera_progress["total_bytes"] += len(blk_data)
-                                                started_at = state.camera_progress.get("started_at") or time.time()
-                                                state.camera_progress["elapsed_seconds"] = round(time.time() - started_at, 2)
+                                                state.camera_progress["elapsed_seconds"] = elapsed
+                                                state.camera_progress["latest_block_index"] = blk_idx
+                                                speed = round(state.camera_progress["total_bytes"] / max(0.01, elapsed), 1)
+                                                state.camera_progress["transfer_speed_bps"] = speed
+
+                                                chunk_record = {
+                                                    "type": "camera_chunk",
+                                                    "index": blk_idx,
+                                                    "size": len(blk_data),
+                                                    "total_blocks": state.camera_progress["blocks_received"],
+                                                    "total_bytes": state.camera_progress["total_bytes"],
+                                                    "elapsed_seconds": elapsed,
+                                                    "hex_preview": blk_data[:16].hex().upper(),
+                                                    "timestamp": now,
+                                                }
+                                                with state.lock:
+                                                    state.camera_chunks.append(chunk_record)
+
+                                                state.broadcast_camera_chunk(chunk_record)
+
                                                 if jpeg_res is not None:
                                                     state.latest_image = jpeg_res
                                                     state.latest_image_metadata = {
@@ -1183,7 +1238,32 @@ HTML_DASHBOARD = """<!DOCTYPE html>
     .metric-sub { font-size: 0.75rem; color: var(--text-muted); margin-top: 0.25rem; font-family: 'JetBrains Mono', monospace; }
     pre { background: rgba(5, 8, 15, 0.95); border: 1px solid var(--card-border); border-radius: 10px; padding: 1rem; font-family: 'JetBrains Mono', monospace; font-size: 0.8rem; color: #a5f3fc; overflow-x: auto; max-height: 280px; }
     .note-box { background: rgba(56, 189, 248, 0.08); border-left: 3px solid var(--accent); padding: 0.75rem 1rem; border-radius: 6px; font-size: 0.85rem; color: #cbd5e1; margin-bottom: 1rem; }
+    .chunk-badge {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      background: rgba(56, 189, 248, 0.15);
+      border: 1px solid rgba(56, 189, 248, 0.5);
+      color: #38bdf8;
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 0.72rem;
+      font-weight: 700;
+      padding: 3px 6px;
+      border-radius: 5px;
+      animation: chunkPop 0.35s cubic-bezier(0.175, 0.885, 0.32, 1.275);
+    }
+    .chunk-badge.duplicate {
+      background: rgba(245, 158, 11, 0.2);
+      border-color: #f59e0b;
+      color: #f59e0b;
+    }
+    @keyframes chunkPop {
+      0% { transform: scale(0.4); opacity: 0; }
+      70% { transform: scale(1.15); opacity: 1; box-shadow: 0 0 12px rgba(56, 189, 248, 0.8); }
+      100% { transform: scale(1); }
+    }
   </style>
+
 </head>
 <body>
   <div class="container">
@@ -1336,20 +1416,40 @@ HTML_DASHBOARD = """<!DOCTYPE html>
         <span id="cameraStatusText" style="font-size: 0.9rem; color: var(--text-muted);">Status: Idle</span>
       </div>
 
+      <!-- Realtime Chunk Progress & Transfer Metrics -->
       <div id="cameraProgressContainer" style="display: none; margin-bottom: 1.25rem;">
-        <div style="font-size: 0.85rem; color: var(--accent); margin-bottom: 0.4rem;" id="cameraProgressDetails">Receiving blocks...</div>
-        <div style="background: rgba(255,255,255,0.08); border-radius: 6px; height: 8px; overflow: hidden;">
-          <div id="cameraProgressBar" style="width: 100%; height: 100%; background: linear-gradient(90deg, #0284c7, #38bdf8); animation: pulse 1.5s infinite;"></div>
+        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.4rem;">
+          <div style="font-size: 0.88rem; color: var(--accent); font-weight: 700;" id="cameraProgressDetails">Receiving blocks...</div>
+          <div style="font-size: 0.8rem; color: var(--text-muted); font-family: monospace;" id="cameraSpeedMetric">Speed: 0 B/s | Rate: 0 blk/s</div>
+        </div>
+        
+        <div style="background: rgba(255,255,255,0.08); border-radius: 6px; height: 10px; overflow: hidden; margin-bottom: 1rem;">
+          <div id="cameraProgressBar" style="width: 0%; height: 100%; background: linear-gradient(90deg, #0284c7, #38bdf8); transition: width 0.3s ease;"></div>
+        </div>
+
+        <!-- Live Interactive Chunk Matrix / Grid -->
+        <div style="margin-bottom: 1rem; background: rgba(5, 8, 15, 0.7); border: 1px solid var(--card-border); border-radius: 10px; padding: 0.85rem;">
+          <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.5rem;">
+            <div style="font-size: 0.75rem; text-transform: uppercase; font-weight: 700; color: var(--text-muted); letter-spacing: 0.05em;">📦 Live Received Chunk Matrix:</div>
+            <div style="font-size: 0.75rem; color: #38bdf8; font-family: 'JetBrains Mono', monospace; font-weight: 700;" id="chunkCountLabel">0 chunks</div>
+          </div>
+          <div id="chunkMatrix" style="display: flex; flex-wrap: wrap; gap: 6px; max-height: 140px; overflow-y: auto; padding: 6px; background: rgba(0,0,0,0.3); border-radius: 6px;"></div>
+        </div>
+
+        <!-- Live Chunk Stream Log -->
+        <div style="background: rgba(5, 8, 15, 0.9); border: 1px solid var(--card-border); border-radius: 8px; padding: 0.6rem 0.85rem; max-height: 90px; overflow-y: auto; font-family: 'JetBrains Mono', monospace; font-size: 0.72rem; color: #a5f3fc;" id="chunkStreamLog">
+          <div style="color: var(--text-muted);">// Real-time chunk packets will stream here...</div>
         </div>
       </div>
 
       <div id="cameraImageContainer" style="text-align: center; background: rgba(5, 8, 15, 0.6); border-radius: 12px; padding: 1.25rem; min-height: 200px; display: flex; flex-direction: column; align-items: center; justify-content: center; border: 1px dashed var(--card-border);">
-        <img id="cameraImgPreview" src="" alt="Satellite Capture Preview" style="max-width: 100%; max-height: 400px; border-radius: 8px; display: none; box-shadow: 0 4px 20px rgba(0,0,0,0.5);" />
+        <img id="cameraImgPreview" src="" alt="Satellite Capture Preview" style="max-width: 100%; max-height: 450px; border-radius: 8px; display: none; box-shadow: 0 4px 25px rgba(0,0,0,0.6);" />
         <div id="cameraPlaceholder" style="color: var(--text-muted); font-size: 0.88rem;">No camera image captured yet. Click "Trigger Camera Capture" to take a picture.</div>
         <div id="cameraMetaInfo" style="margin-top: 0.75rem; font-size: 0.82rem; color: #a5f3fc; font-family: 'JetBrains Mono', monospace; display: none;"></div>
       </div>
     </div>
   </div>
+
 
   <script>
     let isConnected = false;
@@ -1464,10 +1564,66 @@ HTML_DASHBOARD = """<!DOCTYPE html>
     }
 
 
+    const receivedChunks = new Set();
+
+    function renderCameraChunk(chunk) {
+      document.getElementById('cameraProgressContainer').style.display = 'block';
+      const statusText = document.getElementById('cameraStatusText');
+      statusText.innerText = `Status: Receiving Chunk #${chunk.index}...`;
+
+      const details = document.getElementById('cameraProgressDetails');
+      details.innerText = `Block #${chunk.index} received (${(chunk.total_bytes / 1024).toFixed(1)} KB)`;
+
+      const speedMetric = document.getElementById('cameraSpeedMetric');
+      const rate = chunk.elapsed_seconds > 0 ? (chunk.total_blocks / chunk.elapsed_seconds).toFixed(1) : '0';
+      const speed = chunk.elapsed_seconds > 0 ? (chunk.total_bytes / chunk.elapsed_seconds).toFixed(0) : '0';
+      speedMetric.innerText = `Speed: ${speed} B/s | Rate: ${rate} blk/s | Elapsed: ${chunk.elapsed_seconds}s`;
+
+      // Interactive Matrix Grid
+      const matrix = document.getElementById('chunkMatrix');
+      const countLabel = document.getElementById('chunkCountLabel');
+      
+      const badgeId = `chunk_blk_${chunk.index}`;
+      let badge = document.getElementById(badgeId);
+      if (!badge) {
+        badge = document.createElement('span');
+        badge.id = badgeId;
+        badge.className = 'chunk-badge';
+        badge.innerText = '#' + String(chunk.index).padStart(2, '0');
+        badge.title = `Block #${chunk.index} (${chunk.size} bytes)\nHex: ${chunk.hex_preview}...`;
+        matrix.appendChild(badge);
+        receivedChunks.add(chunk.index);
+      } else {
+        badge.className = 'chunk-badge duplicate';
+      }
+      countLabel.innerText = `${receivedChunks.size} blocks received`;
+
+      // Progress bar estimation
+      const estTotalBlocks = Math.max(35, chunk.index + 5);
+      const pct = Math.min(95, Math.round((chunk.total_blocks / estTotalBlocks) * 100));
+      document.getElementById('cameraProgressBar').style.width = pct + '%';
+
+      // Log Stream
+      const log = document.getElementById('chunkStreamLog');
+      const logLine = document.createElement('div');
+      logLine.innerText = `[${chunk.elapsed_seconds.toFixed(2)}s] 📥 Block #${String(chunk.index).padStart(4, '0')} | ${chunk.size}B | Offset 0x${(chunk.index * 240).toString(16).toUpperCase()} | ${chunk.hex_preview}...`;
+      log.appendChild(logLine);
+      log.scrollTop = log.scrollHeight;
+    }
+
     async function triggerCameraCapture() {
       const btn = document.getElementById('btnCameraCapture');
       btn.disabled = true;
       btn.innerText = '⏳ Requesting...';
+
+      // Reset chunks visualizer
+      receivedChunks.clear();
+      document.getElementById('chunkMatrix').innerHTML = '';
+      document.getElementById('chunkStreamLog').innerHTML = '';
+      document.getElementById('chunkCountLabel').innerText = '0 chunks';
+      document.getElementById('cameraProgressBar').style.width = '0%';
+      document.getElementById('cameraSpeedMetric').innerText = 'Speed: 0 B/s | Rate: 0 blk/s';
+
       try {
         const res = await fetch('/api/camera/capture', {
           method: 'POST',
@@ -1503,13 +1659,19 @@ HTML_DASHBOARD = """<!DOCTYPE html>
         if (data.status === 'capturing') {
           statusText.innerText = `Status: Capturing (${data.progress.elapsed_seconds}s)`;
           progDetails.innerText = `Blocks received: ${data.progress.blocks_received} (${(data.progress.total_bytes / 1024).toFixed(1)} KB)`;
+          if (data.progress.transfer_speed_bps) {
+            document.getElementById('cameraSpeedMetric').innerText = `Speed: ${data.progress.transfer_speed_bps} B/s | Elapsed: ${data.progress.elapsed_seconds}s`;
+          }
+          if (data.chunks && data.chunks.length > 0) {
+            data.chunks.forEach(chunk => renderCameraChunk(chunk));
+          }
         } else if (data.status === 'completed') {
           clearInterval(cameraPollingInterval);
           cameraPollingInterval = null;
           btn.disabled = false;
           btn.innerText = '📸 Trigger Camera Capture';
           statusText.innerText = 'Status: Capture Complete! 🎉';
-          document.getElementById('cameraProgressContainer').style.display = 'none';
+          document.getElementById('cameraProgressBar').style.width = '100%';
           loadLatestCameraImage();
         } else if (data.status === 'failed') {
           clearInterval(cameraPollingInterval);
@@ -1517,7 +1679,6 @@ HTML_DASHBOARD = """<!DOCTYPE html>
           btn.disabled = false;
           btn.innerText = '📸 Trigger Camera Capture';
           statusText.innerText = `Status: Failed (${data.progress.error || 'Timeout'})`;
-          document.getElementById('cameraProgressContainer').style.display = 'none';
         }
       } catch (e) {}
     }
@@ -1537,6 +1698,39 @@ HTML_DASHBOARD = """<!DOCTYPE html>
         meta.style.display = 'block';
         meta.innerText = `Size: ${(data.metadata.byte_length / 1024).toFixed(1)} KB | Blocks: ${data.metadata.block_count} | Duration: ${data.metadata.capture_duration_seconds}s`;
       } catch (e) {}
+    }
+
+    function initSSE() {
+      sseSource = new EventSource('/api/telemetry/stream');
+      sseSource.onmessage = (event) => {
+        try {
+          const data = JSON.parse(event.data);
+          if (data.type === 'camera_chunk') {
+            renderCameraChunk(data);
+          } else {
+            renderTelemetry(data);
+          }
+        } catch (e) {}
+      };
+      sseSource.onerror = () => {
+        if (sseSource) { sseSource.close(); sseSource = null; }
+      };
+    }
+
+
+    function renderTelemetry(data) {
+      document.getElementById('valSeq').innerText = '#' + data.packet_sequence;
+      document.getElementById('valUptime').innerText = (data.device_uptime_ms / 1000).toFixed(1) + 's uptime';
+      document.getElementById('valTemp').innerText = data.barometer.temperature_c.toFixed(1) + ' °C';
+      document.getElementById('valPres').innerText = data.barometer.pressure_hpa.toFixed(1) + ' hPa (' + data.barometer.altitude_m.toFixed(1) + 'm)';
+      document.getElementById('valBatt').innerText = data.eps.battery_charge.bus_voltage_v.toFixed(2) + ' V';
+      document.getElementById('valRails').innerText = '5V: ' + data.eps.main_5v_v.toFixed(2) + 'V | 3.3V: ' + data.eps.main_3v3_v.toFixed(2) + 'V';
+      document.getElementById('valGpsCoords').innerText = data.gps.latitude.toFixed(4) + ', ' + data.gps.longitude.toFixed(4);
+      document.getElementById('valGpsStatus').innerText = (data.gps.fix ? 'Fix OK' : 'No Fix') + ' (' + data.gps.satellites + ' sats)';
+      document.getElementById('valAccel').innerText = data.imu.accelerometer_g.x.toFixed(2) + ', ' + data.imu.accelerometer_g.y.toFixed(2) + ', ' + data.imu.accelerometer_g.z.toFixed(2);
+      document.getElementById('valSignal').innerText = data.receiver_rssi.toFixed(1) + ' dBm';
+      document.getElementById('valSnr').innerText = 'SNR: ' + data.receiver_snr.toFixed(2) + ' dB';
+      document.getElementById('jsonDisplay').innerText = JSON.stringify(data, null, 2);
     }
 
     async function handleClientWebSerial() {
@@ -1730,7 +1924,6 @@ HTML_DASHBOARD = """<!DOCTYPE html>
       }
     }
 
-
     async function handleConnect() {
       if (isConnected) {
         await fetch('/api/disconnect', { method: 'POST' });
@@ -1748,32 +1941,6 @@ HTML_DASHBOARD = """<!DOCTYPE html>
         if (!res.ok) alert(data.error || 'Connection failed');
         setTimeout(checkStatus, 500);
       }
-    }
-
-    function initSSE() {
-      sseSource = new EventSource('/api/telemetry/stream');
-      sseSource.onmessage = (event) => {
-        const data = JSON.parse(event.data);
-        renderTelemetry(data);
-      };
-      sseSource.onerror = () => {
-        if (sseSource) { sseSource.close(); sseSource = null; }
-      };
-    }
-
-    function renderTelemetry(data) {
-      document.getElementById('valSeq').innerText = '#' + data.packet_sequence;
-      document.getElementById('valUptime').innerText = (data.device_uptime_ms / 1000).toFixed(1) + 's uptime';
-      document.getElementById('valTemp').innerText = data.barometer.temperature_c.toFixed(1) + ' °C';
-      document.getElementById('valPres').innerText = data.barometer.pressure_hpa.toFixed(1) + ' hPa (' + data.barometer.altitude_m.toFixed(1) + 'm)';
-      document.getElementById('valBatt').innerText = data.eps.battery_charge.bus_voltage_v.toFixed(2) + ' V';
-      document.getElementById('valRails').innerText = '5V: ' + data.eps.main_5v_v.toFixed(2) + 'V | 3.3V: ' + data.eps.main_3v3_v.toFixed(2) + 'V';
-      document.getElementById('valGpsCoords').innerText = data.gps.latitude.toFixed(4) + ', ' + data.gps.longitude.toFixed(4);
-      document.getElementById('valGpsStatus').innerText = (data.gps.fix ? 'Fix OK' : 'No Fix') + ' (' + data.gps.satellites + ' sats)';
-      document.getElementById('valAccel').innerText = data.imu.accelerometer_g.x.toFixed(2) + ', ' + data.imu.accelerometer_g.y.toFixed(2) + ', ' + data.imu.accelerometer_g.z.toFixed(2);
-      document.getElementById('valSignal').innerText = data.receiver_rssi.toFixed(1) + ' dBm';
-      document.getElementById('valSnr').innerText = 'SNR: ' + data.receiver_snr.toFixed(2) + ' dB';
-      document.getElementById('jsonDisplay').innerText = JSON.stringify(data, null, 2);
     }
 
     loadPorts();
@@ -1944,6 +2111,7 @@ class GroundStationAPIHandler(BaseHTTPRequestHandler):
                 self._send_json(HTTPStatus.OK, {
                     "status": state.camera_status,
                     "progress": state.camera_progress,
+                    "chunks": list(state.camera_chunks)[-100:],
                     "has_image": state.latest_image is not None,
                     "metadata": state.latest_image_metadata,
                     "image_url": "/api/camera/latest.jpg" if state.latest_image is not None else None,
