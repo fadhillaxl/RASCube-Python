@@ -32,8 +32,10 @@ from rascube_v2.sdr.pluto import PlutoSDRReceiver, SDRLoRaConfig
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="PlutoSDR (ADALM-PLUTO) Standalone Telemetry Receiver")
+    parser.add_argument("--freq", type=float, default=None, help="Target frequency in MHz (e.g. 926.2)")
+    parser.add_argument("--chan", type=int, default=None, help="RASCube channel 0-17 (e.g. 17 for 926.2 MHz)")
     parser.add_argument("--sat", type=int, default=1581, help="Satellite numeric serial number (default: 1581)")
-    parser.add_argument("--uri", default="ip:192.168.2.10", help="PlutoSDR URI (default: ip:192.168.2.10)")
+    parser.add_argument("--uri", default="usb:", help="PlutoSDR URI (default: usb:, or ip:192.168.2.1)")
     parser.add_argument("--gain", type=float, default=55.0, help="SDR RX hardware gain in dB (default: 55.0)")
     parser.add_argument("--sf", type=int, default=7, help="LoRa Spreading Factor (default: 7)")
     parser.add_argument("--bw", type=int, default=125_000, help="LoRa Bandwidth in Hz (default: 125000)")
@@ -43,9 +45,18 @@ def main() -> None:
 
     args = parser.parse_args()
 
-    serial_number = args.sat
-    freq_mhz = (916_000_000 + (serial_number % 18) * 600_000) / 1e6
-    channel = serial_number % 18
+    if args.freq is not None:
+        freq_mhz = args.freq
+        channel = int(round((freq_mhz - 916.0) / 0.6)) % 18
+        serial_number = args.sat
+    elif args.chan is not None:
+        channel = args.chan % 18
+        freq_mhz = 916.0 + channel * 0.6
+        serial_number = args.sat
+    else:
+        serial_number = args.sat
+        freq_mhz = (916_000_000 + (serial_number % 18) * 600_000) / 1e6
+        channel = serial_number % 18
 
     # 1. Receiver & OBC Status
     receiver_info = ReceiverInfo(software_version=7, git_hash="ADALM-PLUTO", dirty=False)
