@@ -337,12 +337,26 @@ class PlutoSDRTransmitter:
 
         raise RuntimeError(f"Could not connect PlutoSDR TX on any URI: {last_error}")
 
-    def transmit_bytes(self, payload: bytes) -> None:
-        """Modulates payload bytes into LoRa CSS and transmits via PlutoSDR TX antenna."""
+    def transmit_bytes(self, payload: bytes, *, add_address_header: bool = True) -> None:
+        """Modulates payload bytes into LoRa CSS and transmits via PlutoSDR TX antenna.
+
+        Per Section 8.2 of RASCube V2 specification:
+        Direct radio packets require a 5-byte address header:
+        - serialNumber: u32LE (4 bytes)
+        - endpoint ID : u8 (1 byte, 0x00 for ground station)
+        followed by Port + Length + Payload.
+        """
         if self._sdr_device is None:
             self.connect()
+
+        if add_address_header:
+            addr_header = struct.pack("<I", self.config.serial_number) + b"\x00"
+            full_tx_payload = addr_header + payload
+        else:
+            full_tx_payload = payload
+
         iq_tx = generate_lora_tx_waveform(
-            payload,
+            full_tx_payload,
             sf=self.config.spreading_factor,
             bw=self.config.bandwidth_hz,
             samp_rate=self.config.sample_rate,

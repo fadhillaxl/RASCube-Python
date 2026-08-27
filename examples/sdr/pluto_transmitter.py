@@ -48,6 +48,7 @@ def main() -> None:
     cmd_group.add_argument("--rgb", nargs=3, type=int, metavar=("R", "G", "B"), help="Set satellite RGB LED (0-255)")
     cmd_group.add_argument("--song", action="store_true", help="Play satellite startup sound")
     cmd_group.add_argument("--raw-hex", type=str, help="Transmit raw hex payload over the air (e.g. 120100)")
+    cmd_group.add_argument("--blink", action="store_true", help="Blink satellite RGB LED continuously with colors")
     cmd_group.add_argument("--beacon", type=float, nargs="?", const=5.0, metavar="SECONDS", help="Continuous periodic keep-alive beacon")
 
     args = parser.parse_args()
@@ -88,6 +89,29 @@ def main() -> None:
         transmitter.transmit_bytes(payload)
         print("✅ Transmission complete.")
 
+    elif args.blink:
+        colors = [
+            (255, 0, 0, "RED"),
+            (0, 255, 0, "GREEN"),
+            (0, 0, 255, "BLUE"),
+            (255, 255, 0, "YELLOW"),
+            (255, 0, 255, "MAGENTA"),
+            (0, 255, 255, "CYAN"),
+            (255, 255, 255, "WHITE"),
+            (0, 0, 0, "OFF"),
+        ]
+        print("\n[Blink Mode] Transmitting RGB color cycle over the air (Ctrl+C to stop)...\n")
+        try:
+            while True:
+                for r, g, b, name in colors:
+                    payload = bytes([HostPort.ARDUINO_RGB, 0x03, r, g, b])
+                    transmitter.transmit_bytes(payload)
+                    t_str = time.strftime("%H:%M:%S")
+                    print(f"[{t_str}] 💡 LED -> {name} (RGB: {r},{g},{b})", flush=True)
+                    time.sleep(0.8)
+        except KeyboardInterrupt:
+            print("\nBlink mode stopped.")
+
     elif args.song:
         payload = bytes([HostPort.ARDUINO_STARTUP_SONG, 0x01, 0x00])
         print(f"\n[Uplink TX] Triggering startup song -> 0x{payload.hex().upper()}...", flush=True)
@@ -109,7 +133,8 @@ def main() -> None:
             while True:
                 count += 1
                 transmitter.transmit_bytes(payload)
-                print(f"[{time.strftime('%H:%M:%S')}] 📡 Beacon #{count} transmitted to Sat #{args.sat}", flush=True)
+                t_str = time.strftime("%H:%M:%S")
+                print(f"[{t_str}] 📡 Beacon #{count} transmitted to Sat #{args.sat}", flush=True)
                 time.sleep(interval)
         except KeyboardInterrupt:
             print("\nBeacon stopped.")
