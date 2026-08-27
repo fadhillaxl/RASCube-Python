@@ -15,17 +15,20 @@ from rascube_v2.models.telemetry import MainTelemetrySample
 
 @dataclasses.dataclass
 class SDRLoRaConfig:
-    serial_number: int
+    serial_number: int = 1581
+    custom_frequency_hz: int | None = None
     sample_rate: int = 1_000_000
     rx_gain_db: float = 50.0
     spreading_factor: int = 7
     bandwidth_hz: int = 125_000
     coding_rate: str = "4/5"
-    sdr_uri: str = "ip:192.168.2.1"  # Or "usb:..."
+    sdr_uri: str = "usb:"
 
     @property
     def frequency_hz(self) -> int:
-        """Calculate exact LoRa downlink frequency for satellite serial number."""
+        """Calculate exact LoRa downlink frequency for satellite serial number or custom frequency."""
+        if self.custom_frequency_hz is not None:
+            return self.custom_frequency_hz
         channel = self.serial_number % 18
         return 916_000_000 + channel * 600_000
 

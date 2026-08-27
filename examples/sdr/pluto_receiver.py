@@ -80,6 +80,7 @@ def main() -> None:
 
     config = SDRLoRaConfig(
         serial_number=serial_number,
+        custom_frequency_hz=int(freq_mhz * 1e6),
         rx_gain_db=args.gain,
         spreading_factor=args.sf,
         bandwidth_hz=args.bw,
