@@ -114,9 +114,9 @@ class FrameForwarder(gr.sync_block):
     def handle(self, msg):
         try:
             data = pmt.cdr(msg) if pmt.is_pair(msg) else msg
-            raw = bytes(pmt.u8vector_elements(data))
+            raw = bytes(pmt.u8vector_elements(data)) if pmt.is_u8vector(data) else pmt.symbol_to_string(data).encode('latin-1')
             self.sock.sendto(raw, ('127.0.0.1', 9091))
-            print(f'[GR] Decoded packet: {{len(raw)}} bytes  {{raw[:8].hex().upper()}}...', flush=True)
+            print(f'[GR] Decoded LoRa frame: {{len(raw)}} bytes  {{raw[:8].hex().upper()}}...', flush=True)
         except Exception as exc:
             print(f'[GR] Forward error: {{exc}}', flush=True)
 
@@ -131,24 +131,27 @@ rx = lora_sdr_lora_rx(
     pay_len=121,
     samp_rate=1000000,
     sf={args.sf},
-    sync_word=[0x12, 0x34],
+    sync_word=[0x12],
     soft_decoding=True,
     ldro_mode=0,
-    print_rx=[True, False],
+    print_rx=[True, True],
 )
 fwd = FrameForwarder()
+char_sink = blocks.null_sink(gr.sizeof_char)
+
 tb.connect((src, 0), (rx, 0))
+tb.connect((rx, 0), char_sink)
 tb.msg_connect((rx, 'out'), (fwd, 'in'))
-print('[GR] LoRa demodulator ready on UDP:9090 -> forward to UDP:9091', flush=True)
+print('[GR] LoRa demodulator running (UDP:9090 -> UDP:9091)...', flush=True)
 tb.run()
 """
     try:
         gr_proc = subprocess.Popen(
             ["/opt/homebrew/opt/python@3.14/bin/python3.14", "-c", gr_script],
             stdout=sys.stdout,
-            stderr=sys.stdout,  # merge stderr into stdout so we see GR errors
+            stderr=sys.stdout,
         )
-        time.sleep(1.2)  # Wait for GR UDP server to bind
+        time.sleep(1.0)  # Wait for GR UDP server to bind
     except Exception as exc:
         print(f"[GR Error] {exc}", flush=True)
 

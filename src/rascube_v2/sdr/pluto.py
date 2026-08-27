@@ -20,7 +20,7 @@ class SDRLoRaConfig:
     serial_number: int = 1581
     custom_frequency_hz: int | None = None
     sample_rate: int = 1_000_000
-    rx_gain_db: float = 50.0
+    rx_gain_db: float = 40.0
     spreading_factor: int = 7
     bandwidth_hz: int = 125_000
     coding_rate: str = "4/5"
@@ -115,7 +115,7 @@ class PlutoSDRReceiver:
         self._sdr_device.rx_rf_bandwidth = int(self.config.bandwidth_hz * 2)
         self._sdr_device.gain_control_mode_chan0 = "manual"
         self._sdr_device.rx_hardwaregain_chan0 = float(self.config.rx_gain_db)
-        self._sdr_device.rx_buffer_size = 65536
+        self._sdr_device.rx_buffer_size = 16384
 
         # Setup TX if available
         try:
@@ -154,9 +154,10 @@ class PlutoSDRReceiver:
                     time.sleep(0.002)
                     continue
 
-                # Forward raw complex64 I/Q to GNU Radio gr-lora_sdr via UDP
+                # Normalize: PlutoSDR returns raw int16 ADC counts (±2048 for 12-bit ADC)
+                # gr-lora_sdr expects normalized complex64 (≈ ±1.0 range)
                 try:
-                    raw_c64 = iq_data.astype(np.complex64).tobytes()
+                    raw_c64 = (iq_data.astype(np.complex64) / 2048.0).tobytes()
                     for i in range(0, len(raw_c64), CHUNK):
                         udp_sock.sendto(raw_c64[i : i + CHUNK], ("127.0.0.1", 9090))
                 except Exception:
@@ -167,6 +168,7 @@ class PlutoSDRReceiver:
                     time.sleep(0.01)
                 else:
                     break
+
 
     def transmit_packet(self, payload: bytes) -> None:
         """Modulates and transmits a LoRa packet via Pluto+ SDR TX antenna."""
