@@ -22,7 +22,7 @@ class SDRLoRaConfig:
     sample_rate: int = 1_000_000
     rx_gain_db: float = 40.0
     spreading_factor: int = 7
-    bandwidth_hz: int = 125_000
+    bandwidth_hz: int = 500_000
     coding_rate: str = "4/5"
     sdr_uri: str = "usb:"
 
@@ -89,7 +89,7 @@ class PlutoSDRReceiver:
                 dev.rx_rf_bandwidth = int(self.config.bandwidth_hz * 2)
                 dev.gain_control_mode_chan0 = "manual"
                 dev.rx_hardwaregain_chan0 = float(self.config.rx_gain_db)
-                dev.rx_buffer_size = 32768
+                dev.rx_buffer_size = 16384
 
                 # Verify actual buffer read succeeds
                 test_buf = dev.rx()
@@ -146,6 +146,10 @@ class PlutoSDRReceiver:
     def _sdr_rx_worker(self) -> None:
         """Continuous background thread streaming Pluto+ SDR raw I/Q samples to GNU Radio via UDP."""
         udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            udp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4 * 1024 * 1024)
+        except Exception:
+            pass
         CHUNK = 1472  # bytes per UDP datagram = 184 complex64 samples
         while self._running and self._sdr_device is not None:
             try:

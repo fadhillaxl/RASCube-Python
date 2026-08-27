@@ -32,9 +32,9 @@ def main() -> None:
     parser.add_argument("--chan", type=int, default=None, help="RASCube channel 0-17 (e.g. 17 for 926.2 MHz)")
     parser.add_argument("--sat", type=int, default=1581, help="Satellite numeric serial number (default: 1581)")
     parser.add_argument("--uri", default="usb:", help="PlutoSDR URI (default: usb:, or ip:192.168.2.1)")
-    parser.add_argument("--gain", type=float, default=55.0, help="SDR RX hardware gain in dB (default: 55.0)")
+    parser.add_argument("--gain", type=float, default=40.0, help="SDR RX hardware gain in dB (default: 40.0)")
     parser.add_argument("--sf", type=int, default=7, help="LoRa Spreading Factor (default: 7)")
-    parser.add_argument("--bw", type=int, default=125_000, help="LoRa Bandwidth in Hz (default: 125000)")
+    parser.add_argument("--bw", type=int, default=500_000, help="LoRa Bandwidth in Hz (default: 500000)")
     parser.add_argument("--hex", action="store_true", help="Print raw HEX telemetry packets instead of metrics")
 
     args = parser.parse_args()
