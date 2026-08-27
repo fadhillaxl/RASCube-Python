@@ -18,6 +18,7 @@ import collections
 import dataclasses
 import json
 import queue
+import struct
 import threading
 import time
 import urllib.parse
@@ -25,6 +26,7 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
+import numpy as np
 from serial.tools import list_ports
 
 from rascube_v2 import SyncRASCube, decode_telemetry_to_dict
@@ -72,6 +74,23 @@ class GroundStationState:
         self.subscribers: list[queue.Queue[dict[str, Any]]] = []
         self.worker_thread: threading.Thread | None = None
         self.stop_signal = threading.Event()
+
+        # SDR Direct Receiver & Transmitter State
+        self.sdr_active: bool = False
+        self.sdr_sat: int = 1581
+        self.sdr_gain: float = 40.0
+        self.sdr_sf: int = 7
+        self.sdr_bw: int = 500_000
+        self.sdr_uri: str = "usb:"
+        self.sdr_packets_count: int = 0
+        self.sdr_last_rssi: float | None = None
+        self.sdr_last_snr: float | None = None
+        self.sdr_error: str | None = None
+        self.sdr_thread: threading.Thread | None = None
+        self.sdr_stop_event: threading.Event = threading.Event()
+        self.sdr_transmitter: Any | None = None
+        self.sdr_cyclic_active: bool = False
+
 
     def add_subscriber(self) -> queue.Queue[dict[str, Any]]:
         q: queue.Queue[dict[str, Any]] = queue.Queue(maxsize=100)
@@ -203,6 +222,246 @@ def trigger_camera_capture(timeout: float = 30.0) -> None:
     t.start()
 
 
+def background_sdr_receiver_loop(
+    sat: int = 1581,
+    gain: float = 40.0,
+    sf: int = 7,
+    bw: int = 500_000,
+    sdr_uri: str = "usb:",
+) -> None:
+    """Thread worker that tunes PlutoSDR and runs direct real-time DSP LoRa demodulation."""
+    global state
+    freq_hz = 916_000_000 + (sat % 18) * 600_000
+    fs = 1_000_000
+    n_chips = 1 << sf
+    n_samples_per_sym = int(fs * n_chips / bw)
+    os_factor = max(1, n_samples_per_sym // n_chips)
+
+    # Precompute reference base down-chirp
+    t = np.arange(n_samples_per_sym) / fs
+    k = (bw**2) / n_chips
+    phi = 2 * np.pi * (-bw / 2.0 * t + 0.5 * k * (t**2))
+    down_chirp = np.exp(-1j * phi).astype(np.complex64)
+
+    try:
+        import adi
+
+        print(f"[API SDR] Connecting PlutoSDR via '{sdr_uri}' @ {freq_hz/1e6:.3f} MHz...")
+        dev = adi.Pluto(sdr_uri)
+        dev.sample_rate = fs
+        dev.rx_lo = freq_hz
+        dev.rx_rf_bandwidth = 1_000_000
+        dev.gain_control_mode_chan0 = "manual"
+        dev.rx_hardwaregain_chan0 = float(gain)
+        dev.rx_buffer_size = 65536
+
+        with state.lock:
+            state.sdr_active = True
+            state.sdr_sat = sat
+            state.sdr_gain = gain
+            state.sdr_sf = sf
+            state.sdr_bw = bw
+            state.sdr_uri = sdr_uri
+            state.sdr_error = None
+            state.is_connected = True
+            state.connected_port = f"PlutoSDR ({sdr_uri})"
+            state.serial_number = sat
+
+        print(f"[API SDR] PlutoSDR direct DSP receiver running on {freq_hz/1e6:.3f} MHz (Sat #{sat})")
+        dev.rx()  # Warmup
+
+        buf_accum = np.array([], dtype=np.complex64)
+        from rascube_v2.sdr.lora_dsp import LORA_WHITENING_NIBBLES
+
+        while not state.sdr_stop_event.is_set():
+            raw_buf = dev.rx()
+            if raw_buf is None or len(raw_buf) == 0:
+                time.sleep(0.005)
+                continue
+
+            c64_buf = raw_buf.astype(np.complex64) / 2048.0
+            buf_accum = np.concatenate((buf_accum, c64_buf))
+
+            if len(buf_accum) >= 200_000:
+                iq_proc = buf_accum[:200_000]
+                buf_accum = buf_accum[180_000:]
+
+                step = n_samples_per_sym // 4
+                n_steps = (len(iq_proc) - n_samples_per_sym) // step
+
+                all_syms = []
+                for s in range(n_steps):
+                    idx = s * step
+                    win = iq_proc[idx : idx + n_samples_per_sym] * down_chirp
+                    dec = win.reshape(n_chips, os_factor).sum(axis=1)
+                    fft_mag = np.abs(np.fft.fft(dec))
+                    sym = int(np.argmax(fft_mag))
+                    snr = fft_mag[sym] / (np.mean(fft_mag) + 1e-10)
+                    all_syms.append((idx, sym, snr))
+
+                idx = 0
+                while idx < len(all_syms) - 200:
+                    if state.sdr_stop_event.is_set():
+                        break
+                    cands = [all_syms[idx + k * 4] for k in range(8)]
+                    syms = [c[1] for c in cands]
+                    snrs = [c[2] for c in cands]
+
+                    if all(s > 10.0 for s in snrs) and (max(syms) - min(syms) <= 2):
+                        start_sample = cands[0][0]
+                        cfo = syms[0]
+
+                        payload_start = start_sample + int(12.25 * n_samples_per_sym)
+                        frame_symbols = []
+                        for s_idx in range(250):
+                            pos = payload_start + s_idx * n_samples_per_sym
+                            if pos + n_samples_per_sym > len(iq_proc):
+                                break
+                            win = iq_proc[pos : pos + n_samples_per_sym] * down_chirp
+                            dec = win.reshape(n_chips, os_factor).sum(axis=1)
+                            raw_sym = int(np.argmax(np.abs(np.fft.fft(dec))))
+                            frame_symbols.append((raw_sym - cfo) % n_chips)
+
+                        # Demap, deinterleave & dewhiten
+                        mapped = [(s ^ (s >> 1)) for s in frame_symbols]
+                        cw_len = 5
+                        n_blocks = len(mapped) // cw_len
+                        nibbles = []
+                        for blk in range(n_blocks):
+                            block_syms = mapped[blk * cw_len : (blk + 1) * cw_len]
+                            for bit in range(sf):
+                                codeword = 0
+                                for i in range(cw_len):
+                                    shift = (bit + i) % sf
+                                    b = (block_syms[i] >> shift) & 1
+                                    codeword |= b << i
+                                d0 = codeword & 1
+                                d1 = (codeword >> 1) & 1
+                                d2 = (codeword >> 2) & 1
+                                d3 = (codeword >> 3) & 1
+                                nibbles.append((d3 << 3) | (d2 << 2) | (d1 << 1) | d0)
+
+                        unwhitened = [
+                            n ^ LORA_WHITENING_NIBBLES[i % len(LORA_WHITENING_NIBBLES)]
+                            for i, n in enumerate(nibbles)
+                        ]
+                        data_bytes = bytearray()
+                        for i in range(0, len(unwhitened) - 1, 2):
+                            data_bytes.append((unwhitened[i] << 4) | unwhitened[i + 1])
+                        decoded = bytes(data_bytes)
+
+                        if decoded and len(decoded) >= 20:
+                            p_sig = float(
+                                np.mean(np.abs(iq_proc[payload_start : payload_start + 1024]) ** 2) + 1e-12
+                            )
+                            meas_rssi = float(-100.0 + 10.0 * np.log10(p_sig * 1000.0))
+                            meas_snr = float(np.mean(snrs))
+
+                            payload_113 = decoded[:113].ljust(113, b"\x00")
+                            rssi_bytes = struct.pack("<f", meas_rssi)
+                            snr_bytes = struct.pack("<f", meas_snr)
+                            rascube_pkt = bytes([0x10, 0x79]) + payload_113 + rssi_bytes + snr_bytes
+
+                            with state.lock:
+                                state.sdr_packets_count += 1
+                                state.sdr_last_rssi = meas_rssi
+                                state.sdr_last_snr = meas_snr
+
+                            try:
+                                t_dict = decode_telemetry_to_dict(rascube_pkt)
+                                t_dict["raw_hex"] = rascube_pkt.hex().upper()
+                                t_dict["timestamp"] = time.time()
+                                t_dict["source"] = "PlutoSDR"
+                                state.broadcast_telemetry(t_dict)
+                            except Exception:
+                                pass
+
+                        idx += 200
+                    else:
+                        idx += 1
+
+    except Exception as exc:
+        print(f"[API SDR] PlutoSDR error: {exc}")
+        with state.lock:
+            state.sdr_error = str(exc)
+    finally:
+        with state.lock:
+            state.sdr_active = False
+            state.sdr_stop_event.clear()
+            if state.connected_port and "PlutoSDR" in state.connected_port:
+                state.is_connected = False
+                state.connected_port = None
+        print("[API SDR] PlutoSDR direct receiver stopped.")
+
+
+def transmit_sdr_command(
+    sat: int = 1581,
+    cmd_type: str = "ping",
+    params: dict[str, Any] | None = None,
+    bw: int = 500_000,
+    sdr_uri: str = "usb:",
+) -> dict[str, Any]:
+    """Transmits radio command over PlutoSDR to the satellite."""
+    from rascube_v2.constants import HostPort
+    from rascube_v2.sdr.pluto import PlutoSDRTransmitter, SDRLoRaConfig
+
+    if params is None:
+        params = {}
+
+    freq_hz = 916_000_000 + (sat % 18) * 600_000
+    config = SDRLoRaConfig(
+        serial_number=sat,
+        custom_frequency_hz=freq_hz,
+        spreading_factor=7,
+        bandwidth_hz=bw,
+        sdr_uri=sdr_uri,
+    )
+    tx = PlutoSDRTransmitter(config=config, tx_gain_db=0.0)
+
+    if cmd_type == "wake":
+        payload = bytes([HostPort.OBC_INFO, 0x01, 0x00])
+        tx.transmit_cyclic_beacon(payload, gap_seconds=0.15)
+        with state.lock:
+            state.sdr_cyclic_active = True
+            state.sdr_transmitter = tx
+        return {"status": "started", "message": "Hardware FPGA cyclic wake beacon active"}
+
+    elif cmd_type == "stop_wake":
+        with state.lock:
+            if state.sdr_transmitter:
+                state.sdr_transmitter.stop_cyclic_beacon()
+                state.sdr_transmitter = None
+            state.sdr_cyclic_active = False
+        return {"status": "stopped", "message": "Hardware FPGA cyclic wake beacon stopped"}
+
+    elif cmd_type == "ping":
+        payload = bytes([HostPort.OBC_INFO, 0x01, 0x00])
+        tx.transmit_bytes(payload, repeat=3)
+        return {"status": "transmitted", "command": "ping", "hex": payload.hex().upper()}
+
+    elif cmd_type == "rgb":
+        r = int(params.get("r", 255))
+        g = int(params.get("g", 0))
+        b = int(params.get("b", 0))
+        payload = bytes([HostPort.ARDUINO_RGB, 0x03, r, g, b])
+        tx.transmit_bytes(payload, repeat=3)
+        return {"status": "transmitted", "command": "rgb", "r": r, "g": g, "b": b}
+
+    elif cmd_type == "song":
+        payload = bytes([HostPort.ARDUINO_STARTUP_SONG, 0x01, 0x00])
+        tx.transmit_bytes(payload, repeat=3)
+        return {"status": "transmitted", "command": "song"}
+
+    elif cmd_type == "raw_hex":
+        hex_str = params.get("hex", "120100").replace(" ", "").replace("0x", "")
+        payload = bytes.fromhex(hex_str)
+        tx.transmit_bytes(payload, repeat=3)
+        return {"status": "transmitted", "command": "raw_hex", "hex": payload.hex().upper()}
+
+    raise ValueError(f"Unknown command type: {cmd_type}")
+
+
+
 # OpenAPI 3.0 Specification
 OPENAPI_SCHEMA: dict[str, Any] = {
     "openapi": "3.0.3",
@@ -219,6 +478,7 @@ OPENAPI_SCHEMA: dict[str, Any] = {
     ],
     "tags": [
         {"name": "Connection", "description": "Serial Port & Satellite Connection Management"},
+        {"name": "PlutoSDR", "description": "ADALM-PLUTO Radio Ground Station, DSP Demodulator & Uplink Transmitter"},
         {"name": "Telemetry", "description": "Real-time Telemetry, History & HEX Decoding"},
         {"name": "Camera", "description": "Satellite Camera Capture & Image Preview"},
     ],
@@ -619,6 +879,84 @@ OPENAPI_SCHEMA: dict[str, Any] = {
                 },
             }
         },
+        "/api/sdr/status": {
+            "get": {
+                "tags": ["PlutoSDR"],
+                "summary": "Get PlutoSDR Ground Station Status",
+                "description": "Returns active status, tuned frequency, measured RSSI/SNR, and packet count of the PlutoSDR radio.",
+                "responses": {
+                    "200": {
+                        "description": "PlutoSDR hardware status",
+                        "content": {"application/json": {}},
+                    }
+                },
+            }
+        },
+        "/api/sdr/receiver/start": {
+            "post": {
+                "tags": ["PlutoSDR"],
+                "summary": "Start PlutoSDR Real-Time DSP LoRa Receiver",
+                "description": "Starts the hardware SDR receiver thread on specified satellite serial channel with real-time FFT demodulation.",
+                "requestBody": {
+                    "required": True,
+                    "content": {
+                        "application/json": {
+                            "schema": {
+                                "type": "object",
+                                "properties": {
+                                    "sat": {"type": "integer", "example": 1581},
+                                    "gain": {"type": "number", "example": 40.0},
+                                    "sf": {"type": "integer", "example": 7},
+                                    "bw": {"type": "integer", "example": 500000},
+                                    "uri": {"type": "string", "example": "usb:"},
+                                },
+                            }
+                        }
+                    },
+                },
+                "responses": {
+                    "200": {"description": "PlutoSDR receiver started successfully"},
+                },
+            }
+        },
+        "/api/sdr/receiver/stop": {
+            "post": {
+                "tags": ["PlutoSDR"],
+                "summary": "Stop PlutoSDR Receiver",
+                "description": "Stops the real-time SDR receiver worker thread.",
+                "responses": {
+                    "200": {"description": "PlutoSDR receiver stopped"},
+                },
+            }
+        },
+        "/api/sdr/transmit": {
+            "post": {
+                "tags": ["PlutoSDR"],
+                "summary": "Transmit LoRa Uplink Command via PlutoSDR",
+                "description": "Sends radio commands (wake beacon, RGB LED blink, startup song melody, ping) using PlutoSDR RF transmitter.",
+                "requestBody": {
+                    "required": True,
+                    "content": {
+                        "application/json": {
+                            "schema": {
+                                "type": "object",
+                                "required": ["sat", "command"],
+                                "properties": {
+                                    "sat": {"type": "integer", "example": 1581},
+                                    "command": {"type": "string", "enum": ["ping", "blink", "rgb", "song", "wake", "stop_wake", "raw_hex"], "example": "blink"},
+                                    "bw": {"type": "integer", "example": 500000},
+                                    "params": {"type": "object"},
+                                    "uri": {"type": "string", "example": "usb:"},
+                                },
+                            }
+                        }
+                    },
+                },
+                "responses": {
+                    "200": {"description": "Radio command transmitted"},
+                },
+            }
+        },
     },
 }
 
@@ -792,14 +1130,15 @@ HTML_DASHBOARD = """<!DOCTYPE html>
 
     <div class="card">
       <div class="tabs">
-        <button id="tabClientBtn" class="tab-btn active" onclick="switchTab('client')">💻 Client Web Serial (Browser USB)</button>
-        <button id="tabServerBtn" class="tab-btn" onclick="switchTab('server')">🖥️ Server COM Port (Host USB)</button>
+        <button id="tabClientBtn" class="tab-btn active" onclick="switchTab('client')">💻 Client Web USB/Serial</button>
+        <button id="tabServerBtn" class="tab-btn" onclick="switchTab('server')">🖥️ Server COM Port (Dongle)</button>
+        <button id="tabPlutoBtn" class="tab-btn" onclick="switchTab('pluto')">🛰️ PlutoSDR Radio (Direct DSP)</button>
       </div>
 
-      <!-- Tab 1: Client Web Serial -->
+      <!-- Tab 1: Client Web Serial / Web USB -->
       <div id="tabClient">
         <div class="note-box">
-          ✨ <strong>Client Web Serial Mode</strong>: Receiver USB terhubung langsung ke laptop/komputer Anda (Chrome / Edge / Opera). Data dibaca langsung oleh browser dan otomatis dikirim ke backend API.
+          ✨ <strong>Client Web USB / Web Serial Mode</strong>: Receiver USB Dongle terhubung langsung ke browser laptop/komputer Anda (Chrome / Edge / Opera). Data dibaca langsung oleh browser dan otomatis di-ingest ke backend API.
         </div>
         <div class="form-grid" style="grid-template-columns: 1fr 1fr auto;">
           <div>
@@ -817,7 +1156,7 @@ HTML_DASHBOARD = """<!DOCTYPE html>
       <!-- Tab 2: Server COM Port -->
       <div id="tabServer" style="display: none;">
         <div class="note-box">
-          🖥️ <strong>Server Port Mode</strong>: Receiver USB terhubung ke komputer yang menjalankan server Python.
+          🖥️ <strong>Server Port Mode</strong>: Receiver USB Dongle terhubung ke komputer yang menjalankan server Python backend.
         </div>
         <div class="form-grid">
           <div>
@@ -828,11 +1167,55 @@ HTML_DASHBOARD = """<!DOCTYPE html>
             <label>Satellite Serial Number</label>
             <input type="number" id="serialInput" value="1581" placeholder="e.g. 1581" />
           </div>
-          <button id="btnConnect" onclick="handleConnect()">⚡ Connect</button>
+          <button id="btnConnect" onclick="handleConnect()">⚡ Connect Dongle</button>
           <button class="btn-secondary" onclick="loadPorts()">🔄 Refresh Ports</button>
         </div>
       </div>
+
+      <!-- Tab 3: PlutoSDR Radio Direct Hardware DSP -->
+      <div id="tabPluto" style="display: none;">
+        <div class="note-box">
+          🛰️ <strong>PlutoSDR Hardware Real-Time DSP Mode</strong>: Menjalankan demodulator LoRa CSS (SF7, BW 500k/125k, CR 4/5) langsung di hardware ADALM-PLUTO secara real-time.
+        </div>
+        <div class="form-grid" style="grid-template-columns: 1fr 1fr 1fr auto;">
+          <div>
+            <label>Satellite Serial</label>
+            <input type="number" id="sdrSatInput" value="1581" oninput="updateSdrFreq()" />
+            <small id="sdrFreqLabel" style="color: var(--accent); font-size: 0.75rem; font-family: monospace;">Freq: 925.000 MHz (Ch 15)</small>
+          </div>
+          <div>
+            <label>Bandwidth</label>
+            <select id="sdrBwInput">
+              <option value="500000" selected>500 kHz (High Speed)</option>
+              <option value="125000">125 kHz (Standard V2)</option>
+              <option value="250000">250 kHz</option>
+            </select>
+          </div>
+          <div>
+            <label>RX Hardware Gain (dB)</label>
+            <div style="display: flex; align-items: center; gap: 0.5rem;">
+              <input type="range" id="sdrGainSlider" min="0" max="70" value="40" oninput="document.getElementById('sdrGainVal').innerText = this.value + ' dB'" />
+              <span id="sdrGainVal" style="font-family: monospace; font-size: 0.85rem; width: 50px;">40 dB</span>
+            </div>
+          </div>
+          <div style="display: flex; gap: 0.5rem;">
+            <button id="btnSdrStart" onclick="handleSdrToggle()">⚡ Start PlutoSDR RX</button>
+          </div>
+        </div>
+
+        <!-- PlutoSDR Uplink Transmitter Controls -->
+        <div style="margin-top: 1.25rem; padding-top: 1rem; border-top: 1px solid var(--card-border);">
+          <label style="margin-bottom: 0.6rem; color: #fff;">📡 PlutoSDR Radio Uplink Commands:</label>
+          <div style="display: flex; gap: 0.75rem; flex-wrap: wrap; align-items: center;">
+            <button class="btn-secondary" onclick="handleSdrTransmit('blink')">💡 Blink RGB LED</button>
+            <button class="btn-secondary" onclick="handleSdrTransmit('song')">🎵 Play Startup Song</button>
+            <button class="btn-secondary" onclick="handleSdrTransmit('ping')">📡 Send Ping (0x120100)</button>
+            <button id="btnSdrWake" class="btn-secondary" onclick="handleSdrWakeToggle()">⚡ Hardware Wake Beacon (DMA Loop)</button>
+          </div>
+        </div>
+      </div>
     </div>
+
 
     <div class="card">
       <h2>📊 Live Telemetry Stream</h2>
@@ -903,20 +1286,111 @@ HTML_DASHBOARD = """<!DOCTYPE html>
     let clientReader = null;
     let isClientConnected = false;
     let cameraPollingInterval = null;
+    let isSdrActive = false;
+    let isSdrWakeActive = false;
 
     function switchTab(mode) {
-      if (mode === 'client') {
-        document.getElementById('tabClient').style.display = 'block';
-        document.getElementById('tabServer').style.display = 'none';
-        document.getElementById('tabClientBtn').className = 'tab-btn active';
-        document.getElementById('tabServerBtn').className = 'tab-btn';
+      document.getElementById('tabClient').style.display = (mode === 'client') ? 'block' : 'none';
+      document.getElementById('tabServer').style.display = (mode === 'server') ? 'block' : 'none';
+      document.getElementById('tabPluto').style.display = (mode === 'pluto') ? 'block' : 'none';
+
+      document.getElementById('tabClientBtn').className = (mode === 'client') ? 'tab-btn active' : 'tab-btn';
+      document.getElementById('tabServerBtn').className = (mode === 'server') ? 'tab-btn active' : 'tab-btn';
+      document.getElementById('tabPlutoBtn').className = (mode === 'pluto') ? 'tab-btn active' : 'tab-btn';
+    }
+
+    function updateSdrFreq() {
+      const sat = parseInt(document.getElementById('sdrSatInput').value, 10) || 1581;
+      const ch = sat % 18;
+      const freq = (916000000 + ch * 600000) / 1e6;
+      document.getElementById('sdrFreqLabel').innerText = `Freq: ${freq.toFixed(3)} MHz (Ch ${ch})`;
+    }
+
+    async function handleSdrToggle() {
+      const btn = document.getElementById('btnSdrStart');
+      if (isSdrActive) {
+        btn.disabled = true;
+        btn.innerText = '⏳ Stopping...';
+        await fetch('/api/sdr/receiver/stop', { method: 'POST' });
+        isSdrActive = false;
+        btn.innerText = '⚡ Start PlutoSDR RX';
+        btn.className = '';
+        btn.disabled = false;
+        checkStatus();
       } else {
-        document.getElementById('tabClient').style.display = 'none';
-        document.getElementById('tabServer').style.display = 'block';
-        document.getElementById('tabClientBtn').className = 'tab-btn';
-        document.getElementById('tabServerBtn').className = 'tab-btn active';
+        const sat = parseInt(document.getElementById('sdrSatInput').value, 10) || 1581;
+        const gain = parseFloat(document.getElementById('sdrGainSlider').value) || 40.0;
+        const bw = parseInt(document.getElementById('sdrBwInput').value, 10) || 500000;
+
+        btn.disabled = true;
+        btn.innerText = '⏳ Starting SDR...';
+
+        const res = await fetch('/api/sdr/receiver/start', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ sat, gain, bw, sf: 7, uri: 'usb:' })
+        });
+        const data = await res.json();
+        btn.disabled = false;
+
+        if (!res.ok) {
+          alert(data.error || 'Failed to start PlutoSDR');
+          btn.innerText = '⚡ Start PlutoSDR RX';
+          btn.className = '';
+        } else {
+          isSdrActive = true;
+          btn.innerText = '⏹️ Stop PlutoSDR RX';
+          btn.className = 'btn-danger';
+          if (!sseSource) initSSE();
+          checkStatus();
+        }
       }
     }
+
+    async function handleSdrTransmit(cmd) {
+      const sat = parseInt(document.getElementById('sdrSatInput').value, 10) || 1581;
+      const bw = parseInt(document.getElementById('sdrBwInput').value, 10) || 500000;
+
+      try {
+        const res = await fetch('/api/sdr/transmit', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ sat, command: cmd, bw, uri: 'usb:' })
+        });
+        const data = await res.json();
+        if (!res.ok) alert(data.error || 'PlutoSDR TX failed');
+        else console.log('PlutoSDR TX Response:', data);
+      } catch (e) {
+        alert('PlutoSDR TX Error: ' + e.message);
+      }
+    }
+
+    async function handleSdrWakeToggle() {
+      const btn = document.getElementById('btnSdrWake');
+      const sat = parseInt(document.getElementById('sdrSatInput').value, 10) || 1581;
+      const bw = parseInt(document.getElementById('sdrBwInput').value, 10) || 500000;
+
+      if (isSdrWakeActive) {
+        await fetch('/api/sdr/transmit', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ sat, command: 'stop_wake', bw, uri: 'usb:' })
+        });
+        isSdrWakeActive = false;
+        btn.innerText = '⚡ Hardware Wake Beacon (DMA Loop)';
+        btn.className = 'btn-secondary';
+      } else {
+        await fetch('/api/sdr/transmit', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ sat, command: 'wake', bw, uri: 'usb:' })
+        });
+        isSdrWakeActive = true;
+        btn.innerText = '⏹️ Stop Hardware Wake Beacon';
+        btn.className = 'btn-danger';
+      }
+    }
+
 
     async function triggerCameraCapture() {
       const btn = document.getElementById('btnCameraCapture');
@@ -1139,19 +1613,51 @@ HTML_DASHBOARD = """<!DOCTYPE html>
       const text = document.getElementById('statusText');
       const btn = document.getElementById('btnConnect');
 
+      // Check SDR status
+      try {
+        const sdrRes = await fetch('/api/sdr/status');
+        const sdrData = await sdrRes.json();
+        isSdrActive = sdrData.active;
+        isSdrWakeActive = sdrData.cyclic_beacon_active;
+        const sdrBtn = document.getElementById('btnSdrStart');
+        const wakeBtn = document.getElementById('btnSdrWake');
+
+        if (isSdrActive) {
+          sdrBtn.innerText = '⏹️ Stop PlutoSDR RX';
+          sdrBtn.className = 'btn-danger';
+        } else {
+          sdrBtn.innerText = '⚡ Start PlutoSDR RX';
+          sdrBtn.className = '';
+        }
+
+        if (isSdrWakeActive) {
+          wakeBtn.innerText = '⏹️ Stop Hardware Wake Beacon';
+          wakeBtn.className = 'btn-danger';
+        } else {
+          wakeBtn.innerText = '⚡ Hardware Wake Beacon (DMA Loop)';
+          wakeBtn.className = 'btn-secondary';
+        }
+      } catch (e) {}
+
       if (isConnected) {
         badge.className = 'status-badge status-connected';
-        text.innerText = `Server: ${data.connected_port} (#${data.serial_number})`;
-        btn.innerText = 'Disconnect';
-        btn.className = 'btn-danger';
+        text.innerText = `${data.connected_port} (#${data.serial_number})`;
+        if (data.connected_port && data.connected_port.includes('PlutoSDR')) {
+          btn.innerText = '⚡ Connect Dongle';
+          btn.className = '';
+        } else {
+          btn.innerText = 'Disconnect';
+          btn.className = 'btn-danger';
+        }
         if (!sseSource) initSSE();
       } else {
         badge.className = 'status-badge status-disconnected';
         text.innerText = data.error_message ? `Error: ${data.error_message}` : 'Disconnected';
-        btn.innerText = '⚡ Connect';
+        btn.innerText = '⚡ Connect Dongle';
         btn.className = '';
       }
     }
+
 
     async function handleConnect() {
       if (isConnected) {
@@ -1391,6 +1897,25 @@ class GroundStationAPIHandler(BaseHTTPRequestHandler):
             self.wfile.write(img_data)
             return
 
+        # 13. PlutoSDR Ground Station Status
+        if path == "/api/sdr/status":
+            with state.lock:
+                self._send_json(HTTPStatus.OK, {
+                    "active": state.sdr_active,
+                    "sat": state.sdr_sat,
+                    "frequency_hz": 916_000_000 + (state.sdr_sat % 18) * 600_000,
+                    "gain_db": state.sdr_gain,
+                    "sf": state.sdr_sf,
+                    "bw_hz": state.sdr_bw,
+                    "uri": state.sdr_uri,
+                    "packets_decoded": state.sdr_packets_count,
+                    "last_rssi_dbm": state.sdr_last_rssi,
+                    "last_snr_db": state.sdr_last_snr,
+                    "cyclic_beacon_active": state.sdr_cyclic_active,
+                    "error": state.sdr_error,
+                })
+            return
+
         self._send_json(HTTPStatus.NOT_FOUND, {"error": "Endpoint not found"})
 
     def do_POST(self) -> None:
@@ -1505,6 +2030,68 @@ class GroundStationAPIHandler(BaseHTTPRequestHandler):
             except (ProtocolDecodeError, ValueError) as exc:
                 self._send_json(HTTPStatus.UNPROCESSABLE_ENTITY, {"error": str(exc)})
             return
+
+        # 6. Start PlutoSDR Direct DSP Receiver
+        if path == "/api/sdr/receiver/start":
+            sat = int(body_json.get("sat", 1581))
+            gain = float(body_json.get("gain", 40.0))
+            sf = int(body_json.get("sf", 7))
+            bw = int(body_json.get("bw", 500_000))
+            uri = str(body_json.get("uri", "usb:"))
+
+            with state.lock:
+                if state.sdr_active:
+                    state.sdr_stop_event.set()
+                    time.sleep(0.3)
+
+                state.sdr_stop_event.clear()
+                state.sdr_error = None
+                sdr_worker = threading.Thread(
+                    target=background_sdr_receiver_loop,
+                    args=(sat, gain, sf, bw, uri),
+                    daemon=True,
+                    name="pluto-sdr-rx",
+                )
+                state.sdr_thread = sdr_worker
+                sdr_worker.start()
+
+            time.sleep(0.6)
+            with state.lock:
+                self._send_json(HTTPStatus.OK, {
+                    "status": "active" if state.sdr_active else "starting",
+                    "sat": sat,
+                    "frequency_hz": 916_000_000 + (sat % 18) * 600_000,
+                    "gain": gain,
+                    "sf": sf,
+                    "bw": bw,
+                    "uri": uri,
+                    "error": state.sdr_error,
+                })
+            return
+
+        # 7. Stop PlutoSDR Direct DSP Receiver
+        if path == "/api/sdr/receiver/stop":
+            with state.lock:
+                state.sdr_stop_event.set()
+                state.sdr_active = False
+            self._send_json(HTTPStatus.OK, {"status": "stopped"})
+            return
+
+        # 8. PlutoSDR Transmit Commands
+        if path == "/api/sdr/transmit":
+            sat = int(body_json.get("sat", 1581))
+            cmd_type = str(body_json.get("command", "ping"))
+            params = body_json.get("params", {})
+            bw = int(body_json.get("bw", 500_000))
+            uri = str(body_json.get("uri", "usb:"))
+
+            try:
+                res = transmit_sdr_command(sat=sat, cmd_type=cmd_type, params=params, bw=bw, sdr_uri=uri)
+                self._send_json(HTTPStatus.OK, res)
+            except Exception as exc:
+                self._send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(exc)})
+            return
+
 
         self._send_json(HTTPStatus.NOT_FOUND, {"error": "Endpoint not found"})
 
