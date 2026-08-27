@@ -42,9 +42,11 @@ class PlutoSDRReceiver:
         self,
         config: SDRLoRaConfig,
         on_sample: Callable[[MainTelemetrySample], None] | None = None,
+        on_raw_hex: Callable[[str], None] | None = None,
     ) -> None:
         self.config = config
         self.on_sample = on_sample
+        self.on_raw_hex = on_raw_hex
         self._running = False
         self._thread: threading.Thread | None = None
         self._sdr_device: Any = None
@@ -127,14 +129,24 @@ class PlutoSDRReceiver:
                 if not data:
                     continue
 
-                # Process received packet
-                try:
-                    sample = decode_main_telemetry_hex(data)
-                    self.total_packets_received += 1
-                    if self.on_sample:
+                # Format to full 123-byte packet (0x10 0x79 + 121 bytes payload)
+                if len(data) == 121:
+                    raw_packet = bytes([0x10, 0x79]) + data
+                else:
+                    raw_packet = data
+
+                hex_str = raw_packet.hex().upper()
+                self.total_packets_received += 1
+
+                if self.on_raw_hex:
+                    self.on_raw_hex(hex_str)
+
+                if self.on_sample:
+                    try:
+                        sample = decode_main_telemetry_hex(raw_packet)
                         self.on_sample(sample)
-                except Exception as err:
-                    print(f"[SDR Decoder] Failed to decode packet ({len(data)} bytes): {err}")
+                    except Exception as err:
+                        pass
             except socket.timeout:
                 continue
             except Exception as exc:
