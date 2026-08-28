@@ -1861,7 +1861,11 @@ HTML_DASHBOARD = """<!DOCTYPE html>
       }
 
       if (!('serial' in navigator)) {
-        alert('Browser Anda belum mendukung Web Serial API. Silakan gunakan Google Chrome, Edge, atau Opera.');
+        if (location.protocol !== 'https:' && location.hostname !== 'localhost' && location.hostname !== '127.0.0.1') {
+          alert('🔒 Web Serial API mewajibkan "Secure Context" (HTTPS atau localhost) oleh standar keamanan Chrome/Edge.\n\nKarena Anda mengakses via IP (' + location.origin + '):\n1. Buka tab baru di Chrome: chrome://flags/#unsafely-treat-insecure-origin-as-secure\n2. Ubah menjadi "Enabled"\n3. Masukkan URL: ' + location.origin + '\n4. Klik tombol "Relaunch" di kanan bawah.\n\nSetelah Chrome restart, Web USB akan aktif penuh!');
+        } else {
+          alert('Browser Anda belum mendukung Web Serial API. Silakan gunakan Google Chrome, Edge, atau Opera.');
+        }
         return;
       }
 
@@ -2577,14 +2581,48 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="RASCube Ground Station REST API Server with Swagger UI")
     parser.add_argument("--host", default="0.0.0.0", help="Host interface (default: 0.0.0.0)")
     parser.add_argument("--port", type=int, default=8080, help="Port to listen on (default: 8080)")
+    parser.add_argument("--ssl", action="store_true", help="Enable HTTPS (auto-generates self-signed TLS cert if none provided)")
+    parser.add_argument("--ssl-cert", default=None, help="Path to custom SSL certificate (.pem / .crt)")
+    parser.add_argument("--ssl-key", default=None, help="Path to custom SSL private key (.key)")
 
     args = parser.parse_args()
 
     ThreadingHTTPServer.allow_reuse_address = True
     server = ThreadingHTTPServer((args.host, args.port), GroundStationAPIHandler)
-    url = f"http://localhost:{args.port}"
+
+    proto = "http"
+    if args.ssl or args.ssl_cert:
+        import ssl
+        cert_file = args.ssl_cert
+        key_file = args.ssl_key
+
+        if not cert_file:
+            # Auto-generate temporary self-signed certificate using OpenSSL
+            cert_dir = os.path.expanduser("~/.rascube/ssl")
+            os.makedirs(cert_dir, exist_ok=True)
+            cert_file = os.path.join(cert_dir, "server.crt")
+            key_file = os.path.join(cert_dir, "server.key")
+            if not (os.path.exists(cert_file) and os.path.exists(key_file)):
+                try:
+                    import subprocess
+                    subprocess.run([
+                        "openssl", "req", "-x509", "-newkey", "rsa:2048",
+                        "-keyout", key_file, "-out", cert_file,
+                        "-days", "365", "-nodes",
+                        "-subj", "/CN=rascube-groundstation"
+                    ], check=True, capture_output=True)
+                except Exception as e:
+                    print(f"[Warning] Failed to auto-generate SSL cert: {e}")
+
+        if cert_file and os.path.exists(cert_file) and key_file and os.path.exists(key_file):
+            ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            ctx.load_cert_chain(certfile=cert_file, keyfile=key_file)
+            server.socket = ctx.wrap_socket(server.socket, server_side=True)
+            proto = "https"
+
+    url = f"{proto}://localhost:{args.port}"
     print("=" * 65)
-    print("🚀 RASCubeV2 Ground Station API & Swagger UI Server Running")
+    print(f"🚀 RASCubeV2 Ground Station API & Swagger UI Server Running ({proto.upper()})")
     print(f"📖 Swagger UI Docs        : {url}/docs")
     print(f"📄 OpenAPI Specification  : {url}/openapi.json")
     print(f"🛰️ Ground Station Dashboard: {url}/")
