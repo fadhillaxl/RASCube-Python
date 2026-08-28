@@ -14,6 +14,11 @@ COPY src/ ./src/
 COPY examples/ ./examples/
 COPY README.md ./
 
+# Install OpenSSL for automatic self-signed HTTPS certificate generation
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    openssl \
+    && rm -rf /var/lib/apt/lists/*
+
 # Install Python dependencies and local rascube package
 RUN pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir pyserial numpy scipy && \

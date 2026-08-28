@@ -2591,7 +2591,8 @@ def main() -> None:
     server = ThreadingHTTPServer((args.host, args.port), GroundStationAPIHandler)
 
     proto = "http"
-    if args.ssl or args.ssl_cert:
+    enable_ssl = args.ssl or os.environ.get("ENABLE_SSL", "0").lower() in ("1", "true", "yes")
+    if enable_ssl or args.ssl_cert:
         import ssl
         cert_file = args.ssl_cert
         key_file = args.ssl_key
