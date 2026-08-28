@@ -465,8 +465,8 @@ def background_sdr_receiver_loop(
                         if decoded and len(decoded) >= 2:
                             port = decoded[0]
 
-                            # 1. Camera Block Packet (InboundPort.JPEG_CAMERA = 0x20)
-                            if port == 0x20:
+                            # 1. Camera Block Packet (InboundPort.JPEG_CAMERA = 0x15 or 0x20)
+                            if port in (0x15, 0x20):
                                 raw_payload = decoded[2:] if len(decoded) > 2 else decoded
                                 if len(raw_payload) >= 2:
                                     blk_idx = struct.unpack_from("<H", raw_payload, 0)[0]
@@ -1919,7 +1919,11 @@ HTML_DASHBOARD = """<!DOCTYPE html>
                 const len = buffer[1];
                 const frameLen = 2 + len;
 
-                if (port === 0x10 || port === 0x20 || port === 0x01 || port === 0x13 || port === 0x02 || port === 0x03) {
+                const isCameraBlock = (port === 0x15 || port === 0x20) && len === 242;
+                const isTelemetry = (port === 0x10) && len === 121;
+                const isControl = (port === 0x00 || port === 0x01 || port === 0x02 || port === 0x03 || port === 0x0A || port === 0x12 || port === 0x13 || port === 0x80);
+
+                if (isCameraBlock || isTelemetry || isControl) {
                   if (buffer.length < frameLen) {
                     break;
                   }
@@ -1928,7 +1932,7 @@ HTML_DASHBOARD = """<!DOCTYPE html>
                   buffer = buffer.slice(frameLen);
                   const hex = Array.from(frame).map(b => b.toString(16).padStart(2, '0')).join('').toUpperCase();
 
-                  if (port === 0x10) {
+                  if (isTelemetry) {
                     fetch('/api/telemetry/ingest', {
                       method: 'POST',
                       headers: { 'Content-Type': 'application/json' },
@@ -1937,7 +1941,7 @@ HTML_DASHBOARD = """<!DOCTYPE html>
                     .then(r => r.json())
                     .then(res => { if (res.telemetry) renderTelemetry(res.telemetry); })
                     .catch(console.error);
-                  } else if (port === 0x20) {
+                  } else if (isCameraBlock) {
                     // Extract block info immediately for instant zero-latency UI rendering
                     const blockIdx = frame[2] | (frame[3] << 8);
                     const chunkSize = frame.length - 4;
@@ -2390,8 +2394,8 @@ class GroundStationAPIHandler(BaseHTTPRequestHandler):
                 raw_bytes = bytes.fromhex(hex_data)
                 port = raw_bytes[0] if len(raw_bytes) > 0 else None
 
-                # Check if it's a Camera Block (0x20)
-                if port == 0x20:
+                # Check if it's a Camera Block (InboundPort.JPEG_CAMERA = 0x15 or 0x20)
+                if port in (0x15, 0x20):
                     payload = raw_bytes[2:] if len(raw_bytes) > 2 else raw_bytes
                     if len(payload) >= 2:
                         blk_idx = struct.unpack_from("<H", payload, 0)[0]
