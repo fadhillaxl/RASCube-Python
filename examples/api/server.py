@@ -1696,6 +1696,8 @@ HTML_DASHBOARD = """<!DOCTYPE html>
       log.scrollTop = log.scrollHeight;
     }
 
+    let clientCaptureStartTime = null;
+
     async function triggerCameraCapture() {
       const btn = document.getElementById('btnCameraCapture');
       btn.disabled = true;
@@ -1708,6 +1710,7 @@ HTML_DASHBOARD = """<!DOCTYPE html>
       document.getElementById('chunkCountLabel').innerText = '0 chunks';
       document.getElementById('cameraProgressBar').style.width = '0%';
       document.getElementById('cameraSpeedMetric').innerText = 'Speed: 0 B/s | Rate: 0 blk/s';
+      clientCaptureStartTime = Date.now();
 
       try {
         if (isClientConnected && clientPort && clientPort.writable) {
@@ -1935,13 +1938,34 @@ HTML_DASHBOARD = """<!DOCTYPE html>
                     .then(res => { if (res.telemetry) renderTelemetry(res.telemetry); })
                     .catch(console.error);
                   } else if (port === 0x20) {
+                    // Extract block info immediately for instant zero-latency UI rendering
+                    const blockIdx = frame[2] | (frame[3] << 8);
+                    const chunkSize = frame.length - 4;
+                    const hexPreview = Array.from(frame.slice(4, 12)).map(b => b.toString(16).padStart(2, '0')).join('').toUpperCase();
+                    const elapsed = clientCaptureStartTime ? (Date.now() - clientCaptureStartTime) / 1000 : 0;
+
+                    renderCameraChunk({
+                      index: blockIdx,
+                      size: chunkSize,
+                      hex_preview: hexPreview,
+                      total_bytes: (receivedChunks.size + 1) * chunkSize,
+                      total_blocks: receivedChunks.size + 1,
+                      elapsed_seconds: elapsed
+                    });
+
+                    // Ingest to backend in background and update progressive JPEG preview
                     fetch('/api/camera/chunk/ingest', {
                       method: 'POST',
                       headers: { 'Content-Type': 'application/json' },
                       body: JSON.stringify({ hex, source: 'client_web_serial' })
                     })
                     .then(r => r.json())
-                    .then(res => { if (res.chunk) renderCameraChunk(res.chunk); })
+                    .then(res => {
+                      if (res.chunk && res.chunk.partial_jpeg_base64) {
+                        const img = document.getElementById('cameraImgPreview');
+                        if (img) img.src = 'data:image/jpeg;base64,' + res.chunk.partial_jpeg_base64;
+                      }
+                    })
                     .catch(console.error);
                   }
                 } else {
