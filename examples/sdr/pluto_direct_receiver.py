@@ -156,7 +156,7 @@ def main() -> None:
         print_decoded_hex(args.decode)
         return
 
-    freq_hz = 916_000_000 + (args.sat % 18) * 600_000
+    freq_hz = 925_000_000
     fs = 1_000_000
     bw = 500_000
     sf = 7
