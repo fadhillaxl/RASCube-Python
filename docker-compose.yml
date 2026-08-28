@@ -1,0 +1,17 @@
+services:
+  rascube-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: rascube-groundstation
+    restart: unless-stopped
+    ports:
+      - "7072:8080"
+    environment:
+      - PYTHONUNBUFFERED=1
+    # Uncomment the lines below if running on Linux with a physical USB Dongle attached directly to host
+    # privileged: true
+    # devices:
+    #   - /dev/bus/usb:/dev/bus/usb
+    # volumes:
+    #   - /dev:/dev

@@ -1,11 +1,27 @@
 # 🚀 RASCube Ground Station API & Web Dashboard
 
 ## 1. Run Server
+
+### Option A: Local Python
 ```bash
 python examples/api/server.py --port 8080
 ```
 Open Dashboard at: **http://localhost:8080**  
 Open Swagger UI at: **http://localhost:8080/docs**
+
+### Option B: Docker Container (Port 7072)
+```bash
+# 1. Build and Run via Docker Compose
+docker compose up -d
+
+# OR run directly via Docker CLI
+docker build -t rascube-api:latest .
+docker run -d --name rascube-groundstation -p 7072:8080 --restart unless-stopped rascube-api:latest
+```
+Open Dashboard at: **http://localhost:7072**  
+Open Swagger UI at: **http://localhost:7072/docs**  
+Open OpenAPI JSON at: **http://localhost:7072/openapi.json**
+
 
 ---
 

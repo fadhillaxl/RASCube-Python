@@ -318,6 +318,8 @@ Invalid arguments can also raise `ValueError`. Event-stream deadlines raise buil
 ## Examples
 
 - **REST API Server & Swagger Docs**: [`examples/api/server.py`](examples/api/server.py) (See [API Tutorial](examples/api/README.md))
+  - Run locally: `python3 examples/api/server.py --port 8080` (Dashboard at `http://localhost:8080`)
+  - Run via Docker: `docker compose up -d` or `docker run -p 7072:8080 rascube-api:latest` (Dashboard at `http://localhost:7072`)
 - **Raw Telemetry HEX Ingest & Decoder**: [`examples/basic/raw_hex.py`](examples/basic/raw_hex.py) & [`examples/basic/decode_hex.py`](examples/basic/decode_hex.py)
 - **Pluto+ SDR Satellite Receiver**: [`examples/sdr/pluto_receiver.py`](examples/sdr/pluto_receiver.py)
 - **Basic CLI Clients**: [`examples/basic/sync.py`](examples/basic/sync.py) & [`examples/basic/async.py`](examples/basic/async.py)
