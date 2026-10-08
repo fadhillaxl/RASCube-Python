@@ -1653,7 +1653,7 @@ HTML_DASHBOARD = """<!DOCTYPE html>
         badge.setAttribute('data-index', chunk.index);
         badge.className = 'chunk-badge';
         badge.innerText = '#' + String(chunk.index).padStart(2, '0');
-        badge.title = `Block #${chunk.index} (${chunk.size} bytes)\nOffset: 0x${(chunk.index * 240).toString(16).toUpperCase()}\nHex: ${chunk.hex_preview}...`;
+        badge.title = `Block #${chunk.index} (${chunk.size} bytes)\\nOffset: 0x${(chunk.index * 240).toString(16).toUpperCase()}\\nHex: ${chunk.hex_preview}...`;
         
         // Insert in ascending numerical order
         const children = Array.from(matrix.children);
@@ -1865,7 +1865,7 @@ HTML_DASHBOARD = """<!DOCTYPE html>
 
       if (!('serial' in navigator)) {
         if (location.protocol !== 'https:' && location.hostname !== 'localhost' && location.hostname !== '127.0.0.1') {
-          alert('🔒 Web Serial API mewajibkan "Secure Context" (HTTPS atau localhost) oleh standar keamanan Chrome/Edge.\n\nKarena Anda mengakses via IP (' + location.origin + '):\n1. Buka tab baru di Chrome: chrome://flags/#unsafely-treat-insecure-origin-as-secure\n2. Ubah menjadi "Enabled"\n3. Masukkan URL: ' + location.origin + '\n4. Klik tombol "Relaunch" di kanan bawah.\n\nSetelah Chrome restart, Web USB akan aktif penuh!');
+          alert('🔒 Web Serial API mewajibkan "Secure Context" (HTTPS atau localhost) oleh standar keamanan Chrome/Edge.\\n\\nKarena Anda mengakses via IP (' + location.origin + '):\\n1. Buka tab baru di Chrome: chrome://flags/#unsafely-treat-insecure-origin-as-secure\\n2. Ubah menjadi "Enabled"\\n3. Masukkan URL: ' + location.origin + '\\n4. Klik tombol "Relaunch" di kanan bawah.\\n\\nSetelah Chrome restart, Web USB akan aktif penuh!');
         } else {
           alert('Browser Anda belum mendukung Web Serial API. Silakan gunakan Google Chrome, Edge, atau Opera.');
         }
@@ -2158,6 +2158,12 @@ class GroundStationAPIHandler(BaseHTTPRequestHandler):
         # 2. OpenAPI JSON Specification
         if path in ("/openapi.json", "/swagger.json"):
             self._send_json(HTTPStatus.OK, OPENAPI_SCHEMA)
+            return
+
+        # Favicon
+        if path == "/favicon.ico":
+            self.send_response(HTTPStatus.NO_CONTENT)
+            self.end_headers()
             return
 
         # 3. Ground Station Dashboard Web UI

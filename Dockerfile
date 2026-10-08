@@ -8,21 +8,22 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 # Set working directory
 WORKDIR /app
 
-# Copy pyproject.toml and source code
-COPY pyproject.toml ./
-COPY src/ ./src/
-COPY examples/ ./examples/
-COPY README.md ./
-
 # Install OpenSSL for automatic self-signed HTTPS certificate generation
 RUN apt-get update && apt-get install -y --no-install-recommends \
     openssl \
     && rm -rf /var/lib/apt/lists/*
 
-# Install Python dependencies and local rascube package
+# Install Python dependencies first (cached across code edits)
 RUN pip install --no-cache-dir --upgrade pip && \
-    pip install --no-cache-dir pyserial numpy scipy && \
-    pip install --no-cache-dir -e .
+    pip install --no-cache-dir pyserial numpy scipy
+
+# Copy source code and project definitions
+COPY pyproject.toml README.md ./
+COPY src/ ./src/
+COPY examples/ ./examples/
+
+# Install local rascube package
+RUN pip install --no-cache-dir -e .
 
 # Expose internal API port
 EXPOSE 8080
