@@ -10,12 +10,11 @@ services:
     environment:
       - PYTHONUNBUFFERED=1
       # Set ENABLE_SSL=1 to run the server over HTTPS with automatic self-signed SSL certs
+      # Web Serial API requires HTTPS or localhost when accessed over the network
       - ENABLE_SSL=0
     volumes:
       - ./examples:/app/examples
       - ./src:/app/src
-    # Uncomment the lines below if running on Linux with a physical USB Dongle attached directly to host
-    # privileged: true
-    # devices:
-    #   - /dev/bus/usb:/dev/bus/usb
-
+    # Note: RASCube Ground Station uses Client Web USB / Web Serial exclusively.
+    # The USB Receiver Dongle is plugged directly into the client machine/laptop browser.
+    # No USB hardware passthrough or privileged mode is needed on the Docker host!

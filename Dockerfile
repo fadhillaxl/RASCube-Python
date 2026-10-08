@@ -15,7 +15,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 # Install Python dependencies first (cached across code edits)
 RUN pip install --no-cache-dir --upgrade pip && \
-    pip install --no-cache-dir pyserial numpy scipy
+    pip install --no-cache-dir pyserial
 
 # Copy source code and project definitions
 COPY pyproject.toml README.md ./

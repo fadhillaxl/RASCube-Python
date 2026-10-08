@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
-"""RASCubeV2 Ground Station REST & Realtime Streaming API Server.
+"""RASCube Ground Station REST & Realtime Streaming API Server (Client Web USB/Serial Architecture).
 
-Features:
-- Swagger UI Documentation at `/docs` and `/swagger`
-- OpenAPI Specification at `/openapi.json`
-- Ground Station Dashboard UI at `/`
-- Port Management: `GET /api/ports`
-- Connection Controls: `POST /api/connect`, `POST /api/disconnect`, `GET /api/status`
-- Telemetry: `GET /api/telemetry/latest`, `GET /api/telemetry/history`, `GET /api/telemetry/stream`, `POST /api/decode`
+Architecture:
+- Client Web USB/Serial: The USB Receiver Dongle is connected directly to the user's browser (Chrome/Edge/Opera).
+- Live Telemetry & Camera frames are read by the browser and ingested into the server via `/api/telemetry/ingest` and `/api/camera/chunk/ingest`.
+- Real-time Server-Sent Events (SSE) stream at `/api/telemetry/stream`.
+- Swagger UI Documentation at `/docs` and `/swagger`.
+- OpenAPI Specification at `/openapi.json`.
+- Ground Station Web Dashboard at `/`.
 """
 
 from __future__ import annotations
@@ -29,15 +29,9 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
-import numpy as np
-from serial.tools import list_ports
-
-from rascube_v2 import SyncRASCube, decode_telemetry_to_dict
-from rascube_v2.constants import USB_PID_V2, USB_VID
+from rascube_v2 import decode_telemetry_to_dict
 from rascube_v2.exceptions import (
-    CameraAssemblyError,
     ProtocolDecodeError,
-    RequestTimeoutError,
     SessionBusyError,
 )
 from rascube_v2.models.camera import CameraBlock
@@ -48,12 +42,10 @@ from rascube_v2.protocol.camera import CameraAssembler
 class GroundStationState:
     def __init__(self) -> None:
         self.lock = threading.Lock()
-        self.cube: SyncRASCube | None = None
-        self.connected_port: str | None = None
-        self.serial_number: int | None = None
-        self.receiver_info: dict[str, Any] | None = None
-        self.obc_info: dict[str, Any] | None = None
         self.is_connected = False
+        self.connected_source: str | None = None
+        self.connected_port: str | None = None
+        self.serial_number: int = 1581
         self.error_message: str | None = None
 
         # Telemetry storage
@@ -69,6 +61,8 @@ class GroundStationState:
             "total_bytes": 0,
             "started_at": None,
             "elapsed_seconds": 0.0,
+            "transfer_speed_bps": 0.0,
+            "latest_block_index": 0,
             "error": None,
         }
         self.latest_image: bytes | None = None
@@ -78,30 +72,9 @@ class GroundStationState:
         self.camera_chunks: list[dict[str, Any]] = []
         self.camera_assembler = CameraAssembler()
         self.camera_lock = threading.Lock()
-        self.camera_thread: threading.Thread | None = None
-
 
         # SSE Subscribers
         self.subscribers: list[queue.Queue[dict[str, Any]]] = []
-        self.worker_thread: threading.Thread | None = None
-        self.stop_signal = threading.Event()
-
-        # SDR Direct Receiver & Transmitter State
-        self.sdr_active: bool = False
-        self.sdr_sat: int = 1581
-        self.sdr_gain: float = 40.0
-        self.sdr_sf: int = 7
-        self.sdr_bw: int = 500_000
-        self.sdr_uri: str = "usb:"
-        self.sdr_packets_count: int = 0
-        self.sdr_last_rssi: float | None = None
-        self.sdr_last_snr: float | None = None
-        self.sdr_error: str | None = None
-        self.sdr_thread: threading.Thread | None = None
-        self.sdr_stop_event: threading.Event = threading.Event()
-        self.sdr_transmitter: Any | None = None
-        self.sdr_cyclic_active: bool = False
-
 
     def add_subscriber(self) -> queue.Queue[dict[str, Any]]:
         q: queue.Queue[dict[str, Any]] = queue.Queue(maxsize=100)
@@ -138,72 +111,15 @@ class GroundStationState:
                 pass
 
 
-
 state = GroundStationState()
 
 
-def background_telemetry_loop(port: str, serial_number: int) -> None:
-    """Thread worker that manages the serial connection and reads telemetry packets."""
-    global state
-    try:
-        with SyncRASCube(port, serial_number=serial_number) as cube:
-            receiver_info = cube.receiver.get_info()
-            obc_info = None
-            try:
-                obc_info = cube.obc.get_info(timeout=1.0)
-            except Exception:
-                pass
-
-            with state.lock:
-                state.cube = cube
-                state.is_connected = True
-                state.connected_port = port
-                state.serial_number = serial_number
-                state.receiver_info = dataclasses.asdict(receiver_info) if receiver_info else None
-                state.obc_info = dataclasses.asdict(obc_info) if obc_info else None
-                state.error_message = None
-
-            print(f"[API Backend] Connected to {port}, Satellite #{serial_number}")
-
-            for sample in cube.telemetry.iter_samples(timeout=2.0):
-                if state.stop_signal.is_set():
-                    break
-
-                raw_bytes = (
-                    bytes([sample.metadata.port, len(sample.metadata.raw_payload)])
-                    + sample.metadata.raw_payload
-                )
-                raw_hex = raw_bytes.hex().upper()
-
-                telemetry_dict = decode_telemetry_to_dict(raw_bytes)
-                telemetry_dict["raw_hex"] = raw_hex
-                telemetry_dict["timestamp"] = time.time()
-
-                state.broadcast_telemetry(telemetry_dict)
-
-    except Exception as exc:
-        print(f"[API Backend] Connection error: {exc}")
-        with state.lock:
-            state.error_message = str(exc)
-    finally:
-        with state.lock:
-            state.is_connected = False
-            state.cube = None
-            state.stop_signal.clear()
-        print(f"[API Backend] Disconnected from {port}")
-
-
-def trigger_camera_capture(timeout: float = 30.0, source: str = "server") -> None:
-    """Spawns an asynchronous worker to handle camera capture."""
+def trigger_camera_capture(timeout: float = 35.0, source: str = "client_web_serial") -> None:
+    """Initializes camera capture session waiting for chunks from Client Web Serial."""
     global state
     with state.camera_lock:
         if state.camera_status == "capturing":
             raise SessionBusyError("A camera capture session is already in progress")
-        if source != "client_web_serial" and not state.is_connected and not state.sdr_active and state.cube is None:
-            raise ConnectionError(
-                "Receiver is not connected to a satellite. Please connect via Client Web USB (Tab 1), "
-                "Server COM Port (Tab 2), or PlutoSDR (Tab 3) first."
-            )
 
         state.camera_status = "capturing"
         state.camera_assembler.reset()
@@ -220,620 +136,121 @@ def trigger_camera_capture(timeout: float = 30.0, source: str = "server") -> Non
             "error": None,
         }
 
-    def _worker() -> None:
-        start_time = time.time()
-        try:
-            if source == "client_web_serial":
-                print("[API WebUSB] Camera capture session started. Waiting for chunks from Browser Web USB...")
-                while time.time() - start_time < timeout:
-                    with state.camera_lock:
-                        if state.camera_status == "completed":
-                            print(f"[API WebUSB] Camera capture completed: {len(state.latest_image or b'')} bytes")
-                            return
-                        if state.camera_status == "failed":
-                            return
-                    time.sleep(0.2)
-
-                with state.camera_lock:
-                    if state.camera_status == "capturing":
-                        state.camera_status = "failed"
-                        state.camera_progress["error"] = f"Camera capture timed out after {timeout:.1f}s"
-                return
-
-            if state.cube is not None:
-                def on_block(block: Any) -> None:
-                    now = time.time()
-                    elapsed = round(now - start_time, 2)
-                    with state.lock:
-                        state.camera_blocks[block.index] = block.data
-                        state.camera_progress["blocks_received"] += 1
-                        state.camera_progress["total_bytes"] += len(block.data)
-                        state.camera_progress["elapsed_seconds"] = elapsed
-                        state.camera_progress["latest_block_index"] = block.index
-                        speed = round(state.camera_progress["total_bytes"] / max(0.01, elapsed), 1)
-                        state.camera_progress["transfer_speed_bps"] = speed
-
-                        # Assemble contiguous progressive blocks sorted strictly: 0, 1, 2, ...
-                        contiguous = bytearray()
-                        idx = 0
-                        while idx in state.camera_blocks:
-                            contiguous.extend(state.camera_blocks[idx])
-                            idx += 1
-
-                        partial_b64 = None
-                        if len(contiguous) >= 2 and contiguous[:2] == b"\xff\xd8":
-                            if contiguous.find(b"\xff\xd9") < 0:
-                                partial_jpeg = bytes(contiguous) + b"\xff\xd9"
-                            else:
-                                partial_jpeg = bytes(contiguous)
-                            state.partial_image = partial_jpeg
-                            partial_b64 = base64.b64encode(partial_jpeg).decode("ascii")
-
-                        chunk_record = {
-                            "type": "camera_chunk",
-                            "index": block.index,
-                            "size": len(block.data),
-                            "total_blocks": state.camera_progress["blocks_received"],
-                            "contiguous_blocks": idx,
-                            "total_bytes": state.camera_progress["total_bytes"],
-                            "elapsed_seconds": elapsed,
-                            "hex_preview": block.data[:16].hex().upper(),
-                            "partial_jpeg_base64": partial_b64,
-                            "timestamp": now,
-                        }
-                        state.camera_chunks.append(chunk_record)
-
-                    state.broadcast_camera_chunk(chunk_record)
-
-                image = state.cube.camera.capture(timeout=timeout, on_block=on_block)
-                with state.lock:
-                    state.latest_image = image.jpeg
-                    state.latest_image_metadata = {
-                        "block_count": image.block_count,
-                        "duplicate_blocks": len(image.duplicate_blocks),
-                        "byte_length": len(image.jpeg),
-                        "captured_at": time.time(),
-                        "capture_duration_seconds": round(time.time() - start_time, 2),
-                    }
-                    state.camera_status = "completed"
-                print(f"[API Backend] Camera capture completed: {len(image.jpeg)} bytes in {time.time() - start_time:.2f}s")
-
-            elif state.sdr_active:
-                # Transmit camera capture trigger over PlutoSDR RF (HostPort.OBC_CAMERA = 0x13)
-                print(f"[API SDR] Sending camera capture trigger to Satellite #{state.sdr_sat}...")
-                transmit_sdr_command(
-                    sat=state.sdr_sat,
-                    cmd_type="raw_hex",
-                    params={"hex": "130100"},
-                    bw=state.sdr_bw,
-                    sdr_uri=state.sdr_uri,
-                )
-                # Wait for camera blocks to be received and assembled in SDR background receiver loop
-                while time.time() - start_time < timeout:
-                    with state.camera_lock:
-                        if state.camera_status == "completed":
-                            print(f"[API SDR] Camera capture completed: {len(state.latest_image or b'')} bytes")
-                            return
-                        if state.camera_status == "failed":
-                            return
-                    time.sleep(0.2)
-
-                with state.camera_lock:
-                    if state.camera_status == "capturing":
-                        state.camera_status = "failed"
-                        state.camera_progress["error"] = f"Camera capture timed out after {timeout:.1f}s"
-            else:
-                raise ConnectionError("No active satellite connection to trigger camera")
-
-        except Exception as exc:
-            print(f"[API Backend] Camera capture error: {exc}")
-            with state.lock:
+    def _timeout_guard() -> None:
+        time.sleep(timeout)
+        with state.camera_lock:
+            if state.camera_status == "capturing":
                 state.camera_status = "failed"
-                state.camera_progress["error"] = str(exc)
+                state.camera_progress["error"] = f"Camera capture timed out after {timeout:.1f}s"
+                print(f"[API WebUSB] Camera capture timed out after {timeout:.1f}s")
 
-    t = threading.Thread(target=_worker, daemon=True, name="camera-worker")
-    state.camera_thread = t
-    t.start()
-
+    threading.Thread(target=_timeout_guard, daemon=True, name="camera-timeout-guard").start()
 
 
-def background_sdr_receiver_loop(
-    sat: int = 1581,
-    gain: float = 40.0,
-    sf: int = 7,
-    bw: int = 500_000,
-    sdr_uri: str = "usb:",
-) -> None:
-    """Thread worker that tunes PlutoSDR and runs direct real-time DSP LoRa demodulation."""
-    global state
-    freq_hz = 916_000_000 + (sat % 18) * 600_000
-    fs = 1_000_000
-    n_chips = 1 << sf
-    n_samples_per_sym = int(fs * n_chips / bw)
-    os_factor = max(1, n_samples_per_sym // n_chips)
-
-    # Precompute reference base down-chirp
-    t = np.arange(n_samples_per_sym) / fs
-    k = (bw**2) / n_chips
-    phi = 2 * np.pi * (-bw / 2.0 * t + 0.5 * k * (t**2))
-    down_chirp = np.exp(-1j * phi).astype(np.complex64)
-
-    try:
-        import adi
-
-        print(f"[API SDR] Connecting PlutoSDR via '{sdr_uri}' @ {freq_hz/1e6:.3f} MHz...")
-        dev = adi.Pluto(sdr_uri)
-        dev.sample_rate = fs
-        dev.rx_lo = freq_hz
-        dev.rx_rf_bandwidth = 1_000_000
-        dev.gain_control_mode_chan0 = "manual"
-        dev.rx_hardwaregain_chan0 = float(gain)
-        dev.rx_buffer_size = 65536
-
-        with state.lock:
-            state.sdr_active = True
-            state.sdr_sat = sat
-            state.sdr_gain = gain
-            state.sdr_sf = sf
-            state.sdr_bw = bw
-            state.sdr_uri = sdr_uri
-            state.sdr_error = None
-            state.is_connected = True
-            state.connected_port = f"PlutoSDR ({sdr_uri})"
-            state.serial_number = sat
-
-        print(f"[API SDR] PlutoSDR direct DSP receiver running on {freq_hz/1e6:.3f} MHz (Sat #{sat})")
-        dev.rx()  # Warmup
-
-        buf_accum = np.array([], dtype=np.complex64)
-        from rascube_v2.sdr.lora_dsp import LORA_WHITENING_NIBBLES
-
-        while not state.sdr_stop_event.is_set():
-            raw_buf = dev.rx()
-            if raw_buf is None or len(raw_buf) == 0:
-                time.sleep(0.005)
-                continue
-
-            c64_buf = raw_buf.astype(np.complex64) / 2048.0
-            buf_accum = np.concatenate((buf_accum, c64_buf))
-
-            if len(buf_accum) >= 200_000:
-                iq_proc = buf_accum[:200_000]
-                buf_accum = buf_accum[180_000:]
-
-                step = n_samples_per_sym // 4
-                n_steps = (len(iq_proc) - n_samples_per_sym) // step
-
-                all_syms = []
-                for s in range(n_steps):
-                    idx = s * step
-                    win = iq_proc[idx : idx + n_samples_per_sym] * down_chirp
-                    dec = win.reshape(n_chips, os_factor).sum(axis=1)
-                    fft_mag = np.abs(np.fft.fft(dec))
-                    sym = int(np.argmax(fft_mag))
-                    snr = fft_mag[sym] / (np.mean(fft_mag) + 1e-10)
-                    all_syms.append((idx, sym, snr))
-
-                idx = 0
-                while idx < len(all_syms) - 200:
-                    if state.sdr_stop_event.is_set():
-                        break
-                    cands = [all_syms[idx + k * 4] for k in range(8)]
-                    syms = [c[1] for c in cands]
-                    snrs = [c[2] for c in cands]
-
-                    if all(s > 10.0 for s in snrs) and (max(syms) - min(syms) <= 2):
-                        start_sample = cands[0][0]
-                        cfo = syms[0]
-
-                        payload_start = start_sample + int(12.25 * n_samples_per_sym)
-                        frame_symbols = []
-                        for s_idx in range(250):
-                            pos = payload_start + s_idx * n_samples_per_sym
-                            if pos + n_samples_per_sym > len(iq_proc):
-                                break
-                            win = iq_proc[pos : pos + n_samples_per_sym] * down_chirp
-                            dec = win.reshape(n_chips, os_factor).sum(axis=1)
-                            raw_sym = int(np.argmax(np.abs(np.fft.fft(dec))))
-                            frame_symbols.append((raw_sym - cfo) % n_chips)
-
-                        # Demap, deinterleave & dewhiten
-                        mapped = [(s ^ (s >> 1)) for s in frame_symbols]
-                        cw_len = 5
-                        n_blocks = len(mapped) // cw_len
-                        nibbles = []
-                        for blk in range(n_blocks):
-                            block_syms = mapped[blk * cw_len : (blk + 1) * cw_len]
-                            for bit in range(sf):
-                                codeword = 0
-                                for i in range(cw_len):
-                                    shift = (bit + i) % sf
-                                    b = (block_syms[i] >> shift) & 1
-                                    codeword |= b << i
-                                d0 = codeword & 1
-                                d1 = (codeword >> 1) & 1
-                                d2 = (codeword >> 2) & 1
-                                d3 = (codeword >> 3) & 1
-                                nibbles.append((d3 << 3) | (d2 << 2) | (d1 << 1) | d0)
-
-                        unwhitened = [
-                            n ^ LORA_WHITENING_NIBBLES[i % len(LORA_WHITENING_NIBBLES)]
-                            for i, n in enumerate(nibbles)
-                        ]
-                        data_bytes = bytearray()
-                        for i in range(0, len(unwhitened) - 1, 2):
-                            data_bytes.append((unwhitened[i] << 4) | unwhitened[i + 1])
-                        decoded = bytes(data_bytes)
-
-                        if decoded and len(decoded) >= 2:
-                            port = decoded[0]
-
-                            # 1. Camera Block Packet (InboundPort.JPEG_CAMERA = 0x15 or 0x20)
-                            if port in (0x15, 0x20):
-                                raw_payload = decoded[2:] if len(decoded) > 2 else decoded
-                                if len(raw_payload) >= 2:
-                                    blk_idx = struct.unpack_from("<H", raw_payload, 0)[0]
-                                    blk_data = raw_payload[2:]
-                                    block = CameraBlock(index=blk_idx, data=blk_data, metadata=None)
-                                    with state.camera_lock:
-                                        if state.camera_status == "capturing":
-                                            try:
-                                                jpeg_res = state.camera_assembler.add(block)
-                                                now = time.time()
-                                                started_at = state.camera_progress.get("started_at") or now
-                                                elapsed = round(now - started_at, 2)
-                                                state.camera_progress["blocks_received"] += 1
-                                                state.camera_progress["total_bytes"] += len(blk_data)
-                                                state.camera_progress["elapsed_seconds"] = elapsed
-                                                state.camera_progress["latest_block_index"] = blk_idx
-                                                speed = round(state.camera_progress["total_bytes"] / max(0.01, elapsed), 1)
-                                                state.camera_progress["transfer_speed_bps"] = speed
-
-                                                state.camera_blocks[blk_idx] = blk_data
-                                                # Assemble contiguous progressive blocks sorted strictly: 0, 1, 2, ...
-                                                contiguous = bytearray()
-                                                idx = 0
-                                                while idx in state.camera_blocks:
-                                                    contiguous.extend(state.camera_blocks[idx])
-                                                    idx += 1
-
-                                                partial_b64 = None
-                                                if len(contiguous) >= 2 and contiguous[:2] == b"\xff\xd8":
-                                                    if contiguous.find(b"\xff\xd9") < 0:
-                                                        partial_jpeg = bytes(contiguous) + b"\xff\xd9"
-                                                    else:
-                                                        partial_jpeg = bytes(contiguous)
-                                                    state.partial_image = partial_jpeg
-                                                    partial_b64 = base64.b64encode(partial_jpeg).decode("ascii")
-
-                                                chunk_record = {
-                                                    "type": "camera_chunk",
-                                                    "index": blk_idx,
-                                                    "size": len(blk_data),
-                                                    "total_blocks": state.camera_progress["blocks_received"],
-                                                    "contiguous_blocks": idx,
-                                                    "total_bytes": state.camera_progress["total_bytes"],
-                                                    "elapsed_seconds": elapsed,
-                                                    "hex_preview": blk_data[:16].hex().upper(),
-                                                    "partial_jpeg_base64": partial_b64,
-                                                    "timestamp": now,
-                                                }
-                                                with state.lock:
-                                                    state.camera_chunks.append(chunk_record)
-
-                                                state.broadcast_camera_chunk(chunk_record)
-
-                                                if jpeg_res is not None:
-                                                    state.latest_image = jpeg_res
-                                                    state.latest_image_metadata = {
-                                                        "block_count": state.camera_assembler.block_count,
-                                                        "duplicate_blocks": len(state.camera_assembler.duplicates),
-                                                        "byte_length": len(jpeg_res),
-                                                        "captured_at": time.time(),
-                                                        "capture_duration_seconds": state.camera_progress["elapsed_seconds"],
-                                                    }
-                                                    state.camera_status = "completed"
-                                                    print(f"[API SDR] Camera JPEG complete: {len(jpeg_res)} bytes ({state.camera_assembler.block_count} blocks)")
-                                            except Exception as err:
-                                                print(f"[API SDR] Camera assembly error: {err}")
-
-                            # 2. Main Telemetry Packet (InboundPort.MAIN_TELEMETRY = 0x10 or raw payload)
-                            elif len(decoded) >= 20:
-                                p_sig = float(
-                                    np.mean(np.abs(iq_proc[payload_start : payload_start + 1024]) ** 2) + 1e-12
-                                )
-                                meas_rssi = float(-100.0 + 10.0 * np.log10(p_sig * 1000.0))
-                                meas_snr = float(np.mean(snrs))
-
-                                payload_113 = decoded[:113].ljust(113, b"\x00")
-                                rssi_bytes = struct.pack("<f", meas_rssi)
-                                snr_bytes = struct.pack("<f", meas_snr)
-                                rascube_pkt = bytes([0x10, 0x79]) + payload_113 + rssi_bytes + snr_bytes
-
-                                with state.lock:
-                                    state.sdr_packets_count += 1
-                                    state.sdr_last_rssi = meas_rssi
-                                    state.sdr_last_snr = meas_snr
-
-                                try:
-                                    t_dict = decode_telemetry_to_dict(rascube_pkt)
-                                    t_dict["raw_hex"] = rascube_pkt.hex().upper()
-                                    t_dict["timestamp"] = time.time()
-                                    t_dict["source"] = "PlutoSDR"
-                                    state.broadcast_telemetry(t_dict)
-                                except Exception:
-                                    pass
-
-                        idx += 200
-                    else:
-                        idx += 1
-
-
-    except Exception as exc:
-        print(f"[API SDR] PlutoSDR error: {exc}")
-        with state.lock:
-            state.sdr_error = str(exc)
-    finally:
-        with state.lock:
-            state.sdr_active = False
-            state.sdr_stop_event.clear()
-            if state.connected_port and "PlutoSDR" in state.connected_port:
-                state.is_connected = False
-                state.connected_port = None
-        print("[API SDR] PlutoSDR direct receiver stopped.")
-
-
-def transmit_sdr_command(
-    sat: int = 1581,
-    cmd_type: str = "ping",
-    params: dict[str, Any] | None = None,
-    bw: int = 500_000,
-    sdr_uri: str = "usb:",
-) -> dict[str, Any]:
-    """Transmits radio command over PlutoSDR to the satellite."""
-    from rascube_v2.constants import HostPort
-    from rascube_v2.sdr.pluto import PlutoSDRTransmitter, SDRLoRaConfig
-
-    if params is None:
-        params = {}
-
-    freq_hz = 916_000_000 + (sat % 18) * 600_000
-    config = SDRLoRaConfig(
-        serial_number=sat,
-        custom_frequency_hz=freq_hz,
-        spreading_factor=7,
-        bandwidth_hz=bw,
-        sdr_uri=sdr_uri,
-    )
-    tx = PlutoSDRTransmitter(config=config, tx_gain_db=0.0)
-
-    if cmd_type == "wake":
-        payload = bytes([HostPort.OBC_INFO, 0x01, 0x00])
-        tx.transmit_cyclic_beacon(payload, gap_seconds=0.15)
-        with state.lock:
-            state.sdr_cyclic_active = True
-            state.sdr_transmitter = tx
-        return {"status": "started", "message": "Hardware FPGA cyclic wake beacon active"}
-
-    elif cmd_type == "stop_wake":
-        with state.lock:
-            if state.sdr_transmitter:
-                state.sdr_transmitter.stop_cyclic_beacon()
-                state.sdr_transmitter = None
-            state.sdr_cyclic_active = False
-        return {"status": "stopped", "message": "Hardware FPGA cyclic wake beacon stopped"}
-
-    elif cmd_type == "ping":
-        payload = bytes([HostPort.OBC_INFO, 0x01, 0x00])
-        tx.transmit_bytes(payload, repeat=3)
-        return {"status": "transmitted", "command": "ping", "hex": payload.hex().upper()}
-
-    elif cmd_type == "rgb":
-        r = int(params.get("r", 255))
-        g = int(params.get("g", 0))
-        b = int(params.get("b", 0))
-        payload = bytes([HostPort.ARDUINO_RGB, 0x03, r, g, b])
-        tx.transmit_bytes(payload, repeat=3)
-        return {"status": "transmitted", "command": "rgb", "r": r, "g": g, "b": b}
-
-    elif cmd_type == "song":
-        payload = bytes([HostPort.ARDUINO_STARTUP_SONG, 0x01, 0x00])
-        tx.transmit_bytes(payload, repeat=3)
-        return {"status": "transmitted", "command": "song"}
-
-    elif cmd_type == "raw_hex":
-        hex_str = params.get("hex", "120100").replace(" ", "").replace("0x", "")
-        payload = bytes.fromhex(hex_str)
-        tx.transmit_bytes(payload, repeat=3)
-        return {"status": "transmitted", "command": "raw_hex", "hex": payload.hex().upper()}
-
-    raise ValueError(f"Unknown command type: {cmd_type}")
-
-
-
-# OpenAPI 3.0 Specification
+# --- OpenAPI Specification Schema ---
 OPENAPI_SCHEMA: dict[str, Any] = {
     "openapi": "3.0.3",
     "info": {
-        "title": "RASCubeV2 Ground Station & Telemetry API",
-        "description": "REST API and Realtime Streaming API for RASCubeV2 Satellite USB Receiver, Telemetry & Camera Capture",
-        "version": "1.1.0",
+        "title": "RASCube Ground Station API",
+        "description": "Client Web USB/Serial Ground Station REST API, Telemetry Ingestion & Realtime Streaming",
+        "version": "2.0.0",
         "contact": {
             "name": "RASCube Ground Station Team",
         },
     },
     "servers": [
-        {"url": "/", "description": "Local Ground Station Server"}
+        {"url": "/", "description": "Ground Station Server"}
     ],
     "tags": [
-        {"name": "Connection", "description": "Serial Port & Satellite Connection Management"},
-        {"name": "PlutoSDR", "description": "ADALM-PLUTO Radio Ground Station, DSP Demodulator & Uplink Transmitter"},
-        {"name": "Telemetry", "description": "Real-time Telemetry, History & HEX Decoding"},
-        {"name": "Camera", "description": "Satellite Camera Capture & Image Preview"},
+        {"name": "Status", "description": "Ground station status & client connection monitor"},
+        {"name": "Telemetry", "description": "Telemetry ingestion, history, snapshot & SSE real-time stream"},
+        {"name": "Camera", "description": "Satellite camera capture, chunk ingestion & JPEG preview"},
+        {"name": "Decoder", "description": "Standalone telemetry hex decoding utility"},
     ],
     "paths": {
-        "/api/ports": {
-            "get": {
-                "tags": ["Connection"],
-                "summary": "List Available Serial Ports",
-                "description": "Scans and lists all serial/COM ports available on the host machine, identifying connected RASCubeV2 receivers.",
-                "responses": {
-                    "200": {
-                        "description": "List of serial ports",
-                        "content": {
-                            "application/json": {
-                                "example": {
-                                    "ports": [
-                                        {
-                                            "device": "/dev/cu.usbmodem20623154594D1",
-                                            "description": "RASCubeV2 Receiver",
-                                            "vid": 1155,
-                                            "pid": 22336,
-                                            "serial_number": "20623154594D",
-                                            "is_rascube": True,
-                                        }
-                                    ]
-                                }
-                            }
-                        },
-                    }
-                },
-            }
-        },
-        "/api/connect": {
-            "post": {
-                "tags": ["Connection"],
-                "summary": "Connect to Port & Select Satellite",
-                "description": "Opens serial port connection to RASCube receiver, binds to specified satellite serial number, and begins telemetry ingestion.",
-                "requestBody": {
-                    "required": True,
-                    "content": {
-                        "application/json": {
-                            "schema": {
-                                "type": "object",
-                                "required": ["port", "serial_number"],
-                                "properties": {
-                                    "port": {
-                                        "type": "string",
-                                        "description": "Serial port device path",
-                                        "example": "/dev/cu.usbmodem20623154594D1",
-                                    },
-                                    "serial_number": {
-                                        "type": "integer",
-                                        "description": "Numeric satellite serial number",
-                                        "example": 1581,
-                                    },
-                                },
-                            }
-                        }
-                    },
-                },
-                "responses": {
-                    "200": {
-                        "description": "Connection status",
-                        "content": {
-                            "application/json": {
-                                "example": {
-                                    "status": "connected",
-                                    "port": "/dev/cu.usbmodem20623154594D1",
-                                    "serial_number": 1581,
-                                    "receiver_info": {
-                                        "software_version": 7,
-                                        "git_hash": None,
-                                        "dirty": False,
-                                    },
-                                    "error": None,
-                                }
-                            }
-                        },
-                    },
-                    "400": {"description": "Invalid parameters"},
-                },
-            }
-        },
-        "/api/disconnect": {
-            "post": {
-                "tags": ["Connection"],
-                "summary": "Disconnect from Receiver",
-                "description": "Terminates the serial connection and halts background telemetry streaming.",
-                "responses": {
-                    "200": {
-                        "description": "Disconnection status",
-                        "content": {
-                            "application/json": {
-                                "example": {"status": "disconnected"}
-                            }
-                        },
-                    }
-                },
-            }
-        },
         "/api/status": {
             "get": {
-                "tags": ["Connection"],
-                "summary": "Get Connection & Hardware Status",
-                "description": "Returns current connection state, satellite serial number, and firmware info.",
+                "tags": ["Status"],
+                "summary": "Get Ground Station Status",
+                "description": "Returns client Web Serial connection status, target satellite ID, received sample counters, and camera state.",
                 "responses": {
                     "200": {
-                        "description": "Ground station status",
+                        "description": "Ground station status object",
                         "content": {
                             "application/json": {
                                 "example": {
                                     "is_connected": True,
-                                    "connected_port": "/dev/cu.usbmodem20623154594D1",
+                                    "mode": "client_web_serial",
+                                    "connected_port": "Client Web USB/Serial (Browser)",
                                     "serial_number": 1581,
-                                    "total_samples_received": 250,
-                                    "last_received_time": 1787569800.0,
+                                    "total_samples_received": 142,
+                                    "last_received_time": 1729000000.0,
+                                    "camera_status": "idle",
                                     "error_message": None,
                                 }
                             }
                         },
                     }
                 },
+            },
+            "post": {
+                "tags": ["Status"],
+                "summary": "Update Client Connection State",
+                "description": "Announces client browser Web Serial connection or disconnection to the ground station backend.",
+                "requestBody": {
+                    "required": True,
+                    "content": {
+                        "application/json": {
+                            "schema": {
+                                "type": "object",
+                                "properties": {
+                                    "is_connected": {"type": "boolean"},
+                                    "serial_number": {"type": "integer"},
+                                    "source": {"type": "string"},
+                                },
+                            }
+                        }
+                    },
+                },
+                "responses": {
+                    "200": {"description": "Updated status object"}
+                },
+            },
+        },
+        "/api/telemetry/ingest": {
+            "post": {
+                "tags": ["Telemetry"],
+                "summary": "Ingest Telemetry Frame from Web Serial",
+                "description": "Accepts raw telemetry hex frame received by browser via Web Serial, decodes it, saves to history, and broadcasts to SSE clients.",
+                "requestBody": {
+                    "required": True,
+                    "content": {
+                        "application/json": {
+                            "schema": {
+                                "type": "object",
+                                "required": ["hex"],
+                                "properties": {
+                                    "hex": {"type": "string", "description": "Raw 121, 122, or 123 byte HEX telemetry packet"},
+                                    "source": {"type": "string", "example": "client_web_serial"},
+                                },
+                            }
+                        }
+                    },
+                },
+                "responses": {
+                    "200": {"description": "Decoded telemetry payload"},
+                    "422": {"description": "Invalid hex or decode error"},
+                },
             }
         },
         "/api/telemetry/latest": {
             "get": {
                 "tags": ["Telemetry"],
-                "summary": "Get Latest Telemetry Sample",
-                "description": "Fetches the most recently decoded 121-byte telemetry sample with raw HEX.",
+                "summary": "Get Latest Telemetry Snapshot",
+                "description": "Returns the most recently decoded telemetry packet.",
                 "responses": {
-                    "200": {
-                        "description": "Latest telemetry data",
-                        "content": {
-                            "application/json": {
-                                "example": {
-                                    "packet_sequence": 12652,
-                                    "device_uptime_ms": 1726733,
-                                    "barometer": {
-                                        "temperature_c": 31.0,
-                                        "pressure_hpa": 1006.84,
-                                        "altitude_m": 1.28,
-                                    },
-                                    "eps": {
-                                        "main_5v_v": 5.006,
-                                        "main_3v3_v": 3.308,
-                                        "battery_charge": {"bus_voltage_v": 4.056, "current_a": 0.0},
-                                    },
-                                    "imu": {
-                                        "accelerometer_g": {"x": 0.0, "y": 0.016, "z": -1.014},
-                                        "gyroscope_dps": {"x": -0.0175, "y": 0.0, "z": 0.0875},
-                                    },
-                                    "gps": {
-                                        "latitude": -6.263743,
-                                        "longitude": 106.808456,
-                                        "altitude_m": 37.4,
-                                        "satellites": 8,
-                                        "fix": True,
-                                    },
-                                    "receiver_rssi": -31.0,
-                                    "receiver_snr": 13.25,
-                                    "raw_hex": "10796C3100008E13EC0C...",
-                                }
-                            }
-                        },
-                    },
-                    "503": {"description": "No telemetry received yet"},
+                    "200": {"description": "Latest telemetry sample"},
+                    "503": {"description": "No telemetry data received yet"},
                 },
             }
         },
@@ -841,167 +258,78 @@ OPENAPI_SCHEMA: dict[str, Any] = {
             "get": {
                 "tags": ["Telemetry"],
                 "summary": "Get Telemetry History Buffer",
-                "description": "Fetches a circular buffer of recent telemetry packets for charting and graphs.",
+                "description": "Returns up to the last 200 telemetry samples.",
                 "parameters": [
                     {
                         "name": "limit",
                         "in": "query",
-                        "description": "Maximum number of historical samples to retrieve (default: 50, max: 200)",
                         "schema": {"type": "integer", "default": 50},
+                        "description": "Maximum number of samples to retrieve",
                     }
                 ],
                 "responses": {
-                    "200": {
-                        "description": "List of historical telemetry packets",
-                        "content": {
-                            "application/json": {
-                                "example": {
-                                    "count": 50,
-                                    "samples": [],
-                                }
-                            }
-                        },
-                    }
+                    "200": {"description": "List of telemetry samples"}
                 },
             }
         },
         "/api/telemetry/stream": {
             "get": {
                 "tags": ["Telemetry"],
-                "summary": "Realtime SSE Telemetry Stream",
-                "description": "Server-Sent Events (SSE) stream pushing decoded telemetry JSON messages in real-time.",
+                "summary": "Real-time Telemetry Stream (SSE)",
+                "description": "Subscribes to live Server-Sent Events (SSE) telemetry data stream.",
                 "responses": {
                     "200": {
-                        "description": "Realtime event stream",
+                        "description": "Event stream of telemetry JSON packets",
                         "content": {"text/event-stream": {}},
                     }
                 },
             }
         },
-        "/api/telemetry/ingest": {
-            "post": {
-                "tags": ["Telemetry"],
-                "summary": "Ingest Telemetry from Client Web Serial",
-                "description": "Allows a browser client reading local USB via Web Serial API to push raw telemetry packets to the server, decoding and broadcasting to all SSE dashboard clients.",
-                "requestBody": {
-                    "required": True,
-                    "content": {
-                        "application/json": {
-                            "schema": {
-                                "type": "object",
-                                "required": ["hex"],
-                                "properties": {
-                                    "hex": {
-                                        "type": "string",
-                                        "description": "Raw 121-byte payload or 123-byte 10 79... HEX frame",
-                                        "example": "10796C3100008E13EC0CFB0FFA0FFB0FD80F000090070000D00FFA0020010000F0000000A001000000000D591A00ABFF2E0B0700360139A6C4474049A43F000014010DBFFFFF000005009670C8C0EE9DD5429A99154200000000000000009A99993F0801D36237C2636FAD41C4981B440000090000F8C100005441",
-                                    },
-                                    "source": {
-                                        "type": "string",
-                                        "description": "Optional source label",
-                                        "example": "browser_web_serial",
-                                    },
-                                },
-                            }
-                        }
-                    },
-                },
-                "responses": {
-                    "200": {
-                        "description": "Telemetry ingested and broadcasted successfully",
-                        "content": {"application/json": {}},
-                    },
-                    "422": {"description": "Invalid packet payload"},
-                },
-            }
-        },
-        "/api/decode": {
-            "post": {
-                "tags": ["Telemetry"],
-                "summary": "Decode Raw Telemetry HEX",
-                "description": "Decodes any raw hex packet string (121-byte payload or 123-byte 10 79... packet) according to telemetry.md into structured JSON.",
-                "requestBody": {
-                    "required": True,
-                    "content": {
-                        "application/json": {
-                            "schema": {
-                                "type": "object",
-                                "required": ["hex"],
-                                "properties": {
-                                    "hex": {
-                                        "type": "string",
-                                        "description": "Hexadecimal telemetry packet string",
-                                        "example": "10796C3100008E13EC0CFB0FFA0FFB0FD80F000090070000D00FFA0020010000F0000000A001000000000D591A00ABFF2E0B0700360139A6C4474049A43F000014010DBFFFFF000005009670C8C0EE9DD5429A99154200000000000000009A99993F0801D36237C2636FAD41C4981B440000090000F8C100005441",
-                                    }
-                                },
-                            }
-                        }
-                    },
-                },
-                "responses": {
-                    "200": {
-                        "description": "Decoded telemetry payload",
-                        "content": {"application/json": {}},
-                    },
-                    "422": {"description": "Decode or payload length error"},
-                },
-            },
-            "get": {
-                "tags": ["Telemetry"],
-                "summary": "Decode Raw Telemetry HEX via Query Param",
-                "parameters": [
-                    {
-                        "name": "hex",
-                        "in": "query",
-                        "required": True,
-                        "description": "Hex string to decode",
-                        "schema": {"type": "string"},
-                    }
-                ],
-                "responses": {
-                    "200": {"description": "Decoded JSON"},
-                    "422": {"description": "Invalid hex format"},
-                },
-            },
-        },
         "/api/camera/capture": {
             "post": {
                 "tags": ["Camera"],
-                "summary": "Trigger Camera Capture",
-                "description": "Sends command to satellite to capture a JPEG image with progressive block transfer.",
+                "summary": "Initiate Camera Capture Session",
+                "description": "Signals backend that a camera capture session is starting (awaits incoming chunks from Web Serial).",
                 "requestBody": {
-                    "required": False,
                     "content": {
                         "application/json": {
                             "schema": {
                                 "type": "object",
                                 "properties": {
-                                    "timeout": {
-                                        "type": "number",
-                                        "description": "Capture timeout in seconds",
-                                        "example": 35.0,
-                                        "default": 30.0,
-                                    }
+                                    "timeout": {"type": "number", "default": 35.0},
+                                    "source": {"type": "string", "default": "client_web_serial"},
+                                },
+                            }
+                        }
+                    }
+                },
+                "responses": {
+                    "202": {"description": "Camera capture initiated"}
+                },
+            }
+        },
+        "/api/camera/chunk/ingest": {
+            "post": {
+                "tags": ["Camera"],
+                "summary": "Ingest Camera Chunk from Web Serial",
+                "description": "Accepts 242-byte raw camera block from Web Serial, parses block index, updates progressive JPEG preview, and broadcasts chunk.",
+                "requestBody": {
+                    "required": True,
+                    "content": {
+                        "application/json": {
+                            "schema": {
+                                "type": "object",
+                                "required": ["hex"],
+                                "properties": {
+                                    "hex": {"type": "string"},
+                                    "source": {"type": "string", "example": "client_web_serial"},
                                 },
                             }
                         }
                     },
                 },
                 "responses": {
-                    "202": {
-                        "description": "Camera capture initiated",
-                        "content": {
-                            "application/json": {
-                                "example": {
-                                    "status": "capturing",
-                                    "message": "Camera capture initiated with 35.0s timeout",
-                                    "check_status_url": "/api/camera/status",
-                                }
-                            }
-                        },
-                    },
-                    "409": {"description": "Capture already in progress"},
-                    "503": {"description": "Satellite not connected"},
+                    "200": {"description": "Chunk ingested and partial JPEG updated"}
                 },
             }
         },
@@ -1009,146 +337,83 @@ OPENAPI_SCHEMA: dict[str, Any] = {
             "get": {
                 "tags": ["Camera"],
                 "summary": "Get Camera Capture Status & Progress",
-                "description": "Returns current camera session status ('idle', 'capturing', 'completed', 'failed') and received block metrics.",
+                "description": "Returns current camera transfer state, total blocks received, bytes, elapsed seconds, and recent chunks.",
                 "responses": {
-                    "200": {
-                        "description": "Camera capture progress status",
-                        "content": {
-                            "application/json": {
-                                "example": {
-                                    "status": "completed",
-                                    "progress": {
-                                        "blocks_received": 32,
-                                        "total_bytes": 8192,
-                                        "started_at": 1787579100.0,
-                                        "elapsed_seconds": 8.4,
-                                        "error": None,
-                                    },
-                                    "has_image": True,
-                                    "metadata": {
-                                        "block_count": 32,
-                                        "duplicate_blocks": 0,
-                                        "byte_length": 8192,
-                                        "captured_at": 1787579108.4,
-                                        "capture_duration_seconds": 8.4,
-                                    },
-                                    "image_url": "/api/camera/latest.jpg",
-                                }
-                            }
-                        },
-                    }
+                    "200": {"description": "Camera progress information"}
                 },
             }
         },
         "/api/camera/latest": {
             "get": {
                 "tags": ["Camera"],
-                "summary": "Get Latest Captured Image (JSON & Base64)",
-                "description": "Returns latest captured camera image metadata and base64 encoded JPEG payload.",
+                "summary": "Get Latest Camera Image (JSON & Base64)",
+                "description": "Returns the completed JPEG image encoded as base64 alongside capture metadata.",
                 "responses": {
-                    "200": {
-                        "description": "Latest camera image metadata and base64",
-                        "content": {"application/json": {}},
-                    },
-                    "404": {"description": "No camera image captured yet"},
+                    "200": {"description": "Image metadata and base64 string"},
+                    "404": {"description": "No camera image available"},
                 },
             }
         },
         "/api/camera/latest.jpg": {
             "get": {
                 "tags": ["Camera"],
-                "summary": "Get Latest Captured Image (Raw JPEG Binary)",
-                "description": "Serves the latest captured satellite image as raw image/jpeg binary stream.",
+                "summary": "Download Latest Camera Image (Raw Binary JPEG)",
+                "description": "Returns the raw binary JPEG image.",
                 "responses": {
                     "200": {
-                        "description": "Raw JPEG image binary",
+                        "description": "JPEG binary data",
                         "content": {"image/jpeg": {}},
                     },
-                    "404": {"description": "No camera image captured yet"},
+                    "404": {"description": "No camera image available"},
                 },
             }
         },
-        "/api/sdr/status": {
+        "/api/decode": {
             "get": {
-                "tags": ["PlutoSDR"],
-                "summary": "Get PlutoSDR Ground Station Status",
-                "description": "Returns active status, tuned frequency, measured RSSI/SNR, and packet count of the PlutoSDR radio.",
-                "responses": {
-                    "200": {
-                        "description": "PlutoSDR hardware status",
-                        "content": {"application/json": {}},
+                "tags": ["Decoder"],
+                "summary": "Decode HEX via Query Parameter",
+                "parameters": [
+                    {
+                        "name": "hex",
+                        "in": "query",
+                        "required": True,
+                        "schema": {"type": "string"},
+                        "description": "Raw hex telemetry string",
                     }
+                ],
+                "responses": {
+                    "200": {"description": "Decoded telemetry JSON object"},
+                    "422": {"description": "Invalid hex or decode error"},
                 },
-            }
-        },
-        "/api/sdr/receiver/start": {
+            },
             "post": {
-                "tags": ["PlutoSDR"],
-                "summary": "Start PlutoSDR Real-Time DSP LoRa Receiver",
-                "description": "Starts the hardware SDR receiver thread on specified satellite serial channel with real-time FFT demodulation.",
+                "tags": ["Decoder"],
+                "summary": "Decode HEX via Request Body",
                 "requestBody": {
                     "required": True,
                     "content": {
                         "application/json": {
                             "schema": {
                                 "type": "object",
+                                "required": ["hex"],
                                 "properties": {
-                                    "sat": {"type": "integer", "example": 1581},
-                                    "gain": {"type": "number", "example": 40.0},
-                                    "sf": {"type": "integer", "example": 7},
-                                    "bw": {"type": "integer", "example": 500000},
-                                    "uri": {"type": "string", "example": "usb:"},
+                                    "hex": {"type": "string"},
                                 },
                             }
                         }
                     },
                 },
                 "responses": {
-                    "200": {"description": "PlutoSDR receiver started successfully"},
+                    "200": {"description": "Decoded telemetry JSON object"},
+                    "422": {"description": "Invalid hex or decode error"},
                 },
-            }
-        },
-        "/api/sdr/receiver/stop": {
-            "post": {
-                "tags": ["PlutoSDR"],
-                "summary": "Stop PlutoSDR Receiver",
-                "description": "Stops the real-time SDR receiver worker thread.",
-                "responses": {
-                    "200": {"description": "PlutoSDR receiver stopped"},
-                },
-            }
-        },
-        "/api/sdr/transmit": {
-            "post": {
-                "tags": ["PlutoSDR"],
-                "summary": "Transmit LoRa Uplink Command via PlutoSDR",
-                "description": "Sends radio commands (wake beacon, RGB LED blink, startup song melody, ping) using PlutoSDR RF transmitter.",
-                "requestBody": {
-                    "required": True,
-                    "content": {
-                        "application/json": {
-                            "schema": {
-                                "type": "object",
-                                "required": ["sat", "command"],
-                                "properties": {
-                                    "sat": {"type": "integer", "example": 1581},
-                                    "command": {"type": "string", "enum": ["ping", "blink", "rgb", "song", "wake", "stop_wake", "raw_hex"], "example": "blink"},
-                                    "bw": {"type": "integer", "example": 500000},
-                                    "params": {"type": "object"},
-                                    "uri": {"type": "string", "example": "usb:"},
-                                },
-                            }
-                        }
-                    },
-                },
-                "responses": {
-                    "200": {"description": "Radio command transmitted"},
-                },
-            }
+            },
         },
     },
 }
 
+
+# --- Swagger UI HTML Template ---
 SWAGGER_UI_HTML = """<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -1248,12 +513,14 @@ SWAGGER_UI_HTML = """<!DOCTYPE html>
 </html>
 """
 
+
+# --- HTML Dashboard Template (Client Web USB / Web Serial Exclusive) ---
 HTML_DASHBOARD = """<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>RASCube Ground Station API & Dashboard</title>
+  <title>RASCube Ground Station - Client Web USB/Serial Dashboard</title>
   <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700&family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap" rel="stylesheet">
   <style>
     :root {
@@ -1275,17 +542,14 @@ HTML_DASHBOARD = """<!DOCTYPE html>
     .header-links { display: flex; align-items: center; gap: 1rem; }
     .swagger-btn { background: #10b981; color: #022c22; font-weight: 700; text-decoration: none; padding: 0.45rem 1rem; border-radius: 8px; font-size: 0.85rem; display: inline-flex; align-items: center; gap: 0.4rem; }
     .swagger-btn:hover { filter: brightness(1.15); }
-    .status-badge { display: inline-flex; align-items: center; gap: 0.5rem; padding: 0.35rem 0.85rem; border-radius: 9999px; font-size: 0.85rem; font-weight: 700; }
+    .status-badge { display: inline-flex; align-items: center; gap: 0.5rem; padding: 0.35rem 0.85rem; border-radius: 9999px; font-size: 0.85rem; font-weight: 700; transition: all 0.3s ease; }
     .status-connected { background: rgba(16, 185, 129, 0.15); border: 1px solid var(--success); color: var(--success); }
     .status-disconnected { background: rgba(239, 68, 68, 0.15); border: 1px solid var(--danger); color: var(--danger); }
     .status-client { background: rgba(56, 189, 248, 0.15); border: 1px solid var(--accent); color: var(--accent); }
     .status-dot { width: 8px; height: 8px; border-radius: 50%; background: currentColor; }
-    .tabs { display: flex; gap: 0.5rem; margin-bottom: 1.25rem; border-bottom: 1px solid var(--card-border); padding-bottom: 0.5rem; }
-    .tab-btn { background: transparent; color: var(--text-muted); border: none; padding: 0.6rem 1.2rem; font-size: 0.9rem; font-weight: 700; border-radius: 8px; cursor: pointer; transition: all 0.2s; }
-    .tab-btn.active { background: rgba(56, 189, 248, 0.15); color: var(--accent); border: 1px solid var(--accent); }
     .card { background: var(--card-bg); backdrop-filter: blur(12px); border: 1px solid var(--card-border); border-radius: 16px; padding: 1.5rem; margin-bottom: 1.5rem; box-shadow: 0 10px 30px rgba(0,0,0,0.3); }
     .card h2 { font-size: 1.15rem; font-weight: 700; margin-bottom: 1rem; display: flex; align-items: center; gap: 0.5rem; }
-    .form-grid { display: grid; grid-template-columns: 2fr 1fr auto auto; gap: 1rem; align-items: end; }
+    .form-grid { display: grid; grid-template-columns: 1fr 1fr auto; gap: 1rem; align-items: end; }
     label { display: block; font-size: 0.8rem; font-weight: 600; color: var(--text-muted); margin-bottom: 0.4rem; }
     select, input { width: 100%; background: rgba(10, 15, 26, 0.8); border: 1px solid var(--card-border); border-radius: 8px; color: #fff; font-size: 0.9rem; padding: 0.65rem 0.85rem; outline: none; }
     select:focus, input:focus { border-color: var(--accent); }
@@ -1293,13 +557,15 @@ HTML_DASHBOARD = """<!DOCTYPE html>
     button:hover { filter: brightness(1.15); }
     .btn-danger { background: linear-gradient(135deg, #dc2626 0%, #991b1b 100%); }
     .btn-secondary { background: rgba(255,255,255,0.08); border: 1px solid var(--card-border); }
+    .btn-secondary:hover { background: rgba(255,255,255,0.15); }
     .grid-metrics { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 1rem; margin-top: 1rem; }
     .metric-box { background: rgba(15, 23, 42, 0.6); border: 1px solid var(--card-border); border-radius: 12px; padding: 1rem; }
     .metric-label { font-size: 0.72rem; text-transform: uppercase; color: var(--text-muted); font-weight: 600; }
     .metric-value { font-size: 1.35rem; font-weight: 700; font-family: 'JetBrains Mono', monospace; color: #fff; margin-top: 0.25rem; }
     .metric-sub { font-size: 0.75rem; color: var(--text-muted); margin-top: 0.25rem; font-family: 'JetBrains Mono', monospace; }
     pre { background: rgba(5, 8, 15, 0.95); border: 1px solid var(--card-border); border-radius: 10px; padding: 1rem; font-family: 'JetBrains Mono', monospace; font-size: 0.8rem; color: #a5f3fc; overflow-x: auto; max-height: 280px; }
-    .note-box { background: rgba(56, 189, 248, 0.08); border-left: 3px solid var(--accent); padding: 0.75rem 1rem; border-radius: 6px; font-size: 0.85rem; color: #cbd5e1; margin-bottom: 1rem; }
+    .note-box { background: rgba(56, 189, 248, 0.08); border-left: 3px solid var(--accent); padding: 0.75rem 1rem; border-radius: 6px; font-size: 0.85rem; color: #cbd5e1; margin-bottom: 1rem; line-height: 1.5; }
+    .warning-box { background: rgba(245, 158, 11, 0.1); border-left: 3px solid var(--warning); padding: 0.75rem 1rem; border-radius: 6px; font-size: 0.85rem; color: #fde68a; margin-bottom: 1rem; line-height: 1.5; display: none; }
     .chunk-badge {
       display: inline-flex;
       align-items: center;
@@ -1314,25 +580,38 @@ HTML_DASHBOARD = """<!DOCTYPE html>
       border-radius: 5px;
       animation: chunkPop 0.35s cubic-bezier(0.175, 0.885, 0.32, 1.275);
     }
-    .chunk-badge.duplicate {
-      background: rgba(245, 158, 11, 0.2);
-      border-color: #f59e0b;
-      color: #f59e0b;
-    }
     @keyframes chunkPop {
       0% { transform: scale(0.4); opacity: 0; }
       70% { transform: scale(1.15); opacity: 1; box-shadow: 0 0 12px rgba(56, 189, 248, 0.8); }
       100% { transform: scale(1); }
     }
+    #toast {
+      position: fixed;
+      bottom: 2rem;
+      right: 2rem;
+      background: #0284c7;
+      color: #fff;
+      padding: 0.75rem 1.25rem;
+      border-radius: 8px;
+      font-size: 0.88rem;
+      font-weight: 600;
+      box-shadow: 0 8px 24px rgba(0,0,0,0.5);
+      display: none;
+      z-index: 9999;
+      animation: fadeIn 0.3s ease;
+    }
+    @keyframes fadeIn {
+      from { opacity: 0; transform: translateY(10px); }
+      to { opacity: 1; transform: translateY(0); }
+    }
   </style>
-
 </head>
 <body>
   <div class="container">
     <header>
       <div>
         <h1 style="font-size: 1.6rem; font-weight: 800;">🛰️ RASCube Ground Station</h1>
-        <div style="color: var(--text-muted); font-size: 0.9rem; margin-top: 0.2rem;">Live Satellite Telemetry Server & Realtime API</div>
+        <div style="color: var(--text-muted); font-size: 0.9rem; margin-top: 0.2rem;">Client Web USB / Web Serial Dashboard & Realtime API</div>
       </div>
       <div class="header-links">
         <a href="/docs" target="_blank" class="swagger-btn">📖 Swagger UI Docs</a>
@@ -1342,95 +621,41 @@ HTML_DASHBOARD = """<!DOCTYPE html>
       </div>
     </header>
 
+    <!-- Client Web USB / Serial Connection Card -->
     <div class="card">
-      <div class="tabs">
-        <button id="tabClientBtn" class="tab-btn active" onclick="switchTab('client')">💻 Client Web USB/Serial</button>
-        <button id="tabServerBtn" class="tab-btn" onclick="switchTab('server')">🖥️ Server COM Port (Dongle)</button>
-        <button id="tabPlutoBtn" class="tab-btn" onclick="switchTab('pluto')">🛰️ PlutoSDR Radio (Direct DSP)</button>
+      <h2>🔌 Client Web USB / Web Serial Interface</h2>
+      <div class="note-box">
+        💻 <strong>Direct Browser Connection</strong>: Receiver USB Dongle terhubung langsung ke port USB laptop/komputer Anda. Browser (Chrome / Edge / Opera) membaca paket satelit secara real-time via Web Serial API dan otomatis menyinkronkannya ke Ground Station API & SSE Stream.
+      </div>
+      <div id="secureNotice" class="warning-box">
+        🔒 <strong>Secure Context Required</strong>: Web Serial mewajibkan akses via HTTPS atau localhost. Jika Anda membuka dashboard ini dari IP server LAN (misal: <code>http://192.168.x.x:8080</code>), aktifkan flag Chrome: <br>
+        <code>chrome://flags/#unsafely-treat-insecure-origin-as-secure</code> &rarr; Enabled &rarr; Tambahkan origin URL Anda &rarr; Relaunch browser. Atau gunakan mode HTTPS (ENABLE_SSL=1).
+      </div>
+      <div class="form-grid">
+        <div>
+          <label>Target Satellite Serial Number</label>
+          <input type="number" id="clientSerialInput" value="1581" placeholder="e.g. 1581" />
+        </div>
+        <div>
+          <label>Baud Rate</label>
+          <input type="number" id="clientBaudInput" value="1000000" />
+        </div>
+        <button id="btnClientConnect" onclick="handleClientWebSerial()">🔌 Connect Browser USB</button>
       </div>
 
-      <!-- Tab 1: Client Web Serial / Web USB -->
-      <div id="tabClient">
-        <div class="note-box">
-          ✨ <strong>Client Web USB / Web Serial Mode</strong>: Receiver USB Dongle terhubung langsung ke browser laptop/komputer Anda (Chrome / Edge / Opera). Data dibaca langsung oleh browser dan otomatis di-ingest ke backend API.
-        </div>
-        <div class="form-grid" style="grid-template-columns: 1fr 1fr auto;">
-          <div>
-            <label>Satellite Serial Number</label>
-            <input type="number" id="clientSerialInput" value="1581" placeholder="e.g. 1581" />
-          </div>
-          <div>
-            <label>Baud Rate</label>
-            <input type="number" id="clientBaudInput" value="1000000" />
-          </div>
-          <button id="btnClientConnect" onclick="handleClientWebSerial()">🔌 Connect Browser USB</button>
-        </div>
-      </div>
-
-      <!-- Tab 2: Server COM Port -->
-      <div id="tabServer" style="display: none;">
-        <div class="note-box">
-          🖥️ <strong>Server Port Mode</strong>: Receiver USB Dongle terhubung ke komputer yang menjalankan server Python backend.
-        </div>
-        <div class="form-grid">
-          <div>
-            <label>Select COM Port</label>
-            <select id="portSelect"></select>
-          </div>
-          <div>
-            <label>Satellite Serial Number</label>
-            <input type="number" id="serialInput" value="1581" placeholder="e.g. 1581" />
-          </div>
-          <button id="btnConnect" onclick="handleConnect()">⚡ Connect Dongle</button>
-          <button class="btn-secondary" onclick="loadPorts()">🔄 Refresh Ports</button>
-        </div>
-      </div>
-
-      <!-- Tab 3: PlutoSDR Radio Direct Hardware DSP -->
-      <div id="tabPluto" style="display: none;">
-        <div class="note-box">
-          🛰️ <strong>PlutoSDR Hardware Real-Time DSP Mode</strong>: Menjalankan demodulator LoRa CSS (SF7, BW 500k/125k, CR 4/5) langsung di hardware ADALM-PLUTO secara real-time.
-        </div>
-        <div class="form-grid" style="grid-template-columns: 1fr 1fr 1fr auto;">
-          <div>
-            <label>Satellite Serial</label>
-            <input type="number" id="sdrSatInput" value="1581" oninput="updateSdrFreq()" />
-            <small id="sdrFreqLabel" style="color: var(--accent); font-size: 0.75rem; font-family: monospace;">Freq: 925.000 MHz (Ch 15)</small>
-          </div>
-          <div>
-            <label>Bandwidth</label>
-            <select id="sdrBwInput">
-              <option value="500000" selected>500 kHz (High Speed)</option>
-              <option value="125000">125 kHz (Standard V2)</option>
-              <option value="250000">250 kHz</option>
-            </select>
-          </div>
-          <div>
-            <label>RX Hardware Gain (dB)</label>
-            <div style="display: flex; align-items: center; gap: 0.5rem;">
-              <input type="range" id="sdrGainSlider" min="0" max="70" value="40" oninput="document.getElementById('sdrGainVal').innerText = this.value + ' dB'" />
-              <span id="sdrGainVal" style="font-family: monospace; font-size: 0.85rem; width: 50px;">40 dB</span>
-            </div>
-          </div>
-          <div style="display: flex; gap: 0.5rem;">
-            <button id="btnSdrStart" onclick="handleSdrToggle()">⚡ Start PlutoSDR RX</button>
-          </div>
-        </div>
-
-        <!-- PlutoSDR Uplink Transmitter Controls -->
-        <div style="margin-top: 1.25rem; padding-top: 1rem; border-top: 1px solid var(--card-border);">
-          <label style="margin-bottom: 0.6rem; color: #fff;">📡 PlutoSDR Radio Uplink Commands:</label>
-          <div style="display: flex; gap: 0.75rem; flex-wrap: wrap; align-items: center;">
-            <button class="btn-secondary" onclick="handleSdrTransmit('blink')">💡 Blink RGB LED</button>
-            <button class="btn-secondary" onclick="handleSdrTransmit('song')">🎵 Play Startup Song</button>
-            <button class="btn-secondary" onclick="handleSdrTransmit('ping')">📡 Send Ping (0x120100)</button>
-            <button id="btnSdrWake" class="btn-secondary" onclick="handleSdrWakeToggle()">⚡ Hardware Wake Beacon (DMA Loop)</button>
-          </div>
+      <!-- Satellite Radio Uplink Controls (Active when connected) -->
+      <div style="margin-top: 1.25rem; padding-top: 1rem; border-top: 1px solid var(--card-border);">
+        <label style="margin-bottom: 0.6rem; color: #fff;">📡 Direct Satellite Radio Uplink Commands (via Browser Web Serial):</label>
+        <div style="display: flex; gap: 0.75rem; flex-wrap: wrap; align-items: center;">
+          <button class="btn-secondary" onclick="sendBlinkLed()" id="btnUplinkBlink">💡 Blink RGB LED</button>
+          <button class="btn-secondary" onclick="sendStartupSong()" id="btnUplinkSong">🎵 Play Startup Song</button>
+          <button class="btn-secondary" onclick="sendPing()" id="btnUplinkPing">📡 Ping Satellite (OBC Info)</button>
+          <button class="btn-secondary" onclick="triggerCameraCapture()" id="btnUplinkCamera">📸 Capture Satellite Photo</button>
         </div>
       </div>
     </div>
 
-
+    <!-- Live Telemetry Stream Section -->
     <div class="card">
       <h2>📊 Live Telemetry Stream</h2>
       <div class="grid-metrics">
@@ -1467,7 +692,7 @@ HTML_DASHBOARD = """<!DOCTYPE html>
       </div>
 
       <h2 style="margin-top: 1.5rem;">📜 Latest Telemetry JSON & Raw HEX</h2>
-      <pre id="jsonDisplay">// Waiting for telemetry data...</pre>
+      <pre id="jsonDisplay">// Waiting for telemetry data from Web Serial...</pre>
     </div>
 
     <!-- Satellite Camera Section -->
@@ -1512,339 +737,46 @@ HTML_DASHBOARD = """<!DOCTYPE html>
     </div>
   </div>
 
+  <div id="toast"></div>
 
   <script>
-    let isConnected = false;
-    let sseSource = null;
+    let isClientConnected = false;
     let clientPort = null;
     let clientReader = null;
-    let isClientConnected = false;
+    let sseSource = null;
     let cameraPollingInterval = null;
-    let isSdrActive = false;
-    let isSdrWakeActive = false;
-
-    function switchTab(mode) {
-      document.getElementById('tabClient').style.display = (mode === 'client') ? 'block' : 'none';
-      document.getElementById('tabServer').style.display = (mode === 'server') ? 'block' : 'none';
-      document.getElementById('tabPluto').style.display = (mode === 'pluto') ? 'block' : 'none';
-
-      document.getElementById('tabClientBtn').className = (mode === 'client') ? 'tab-btn active' : 'tab-btn';
-      document.getElementById('tabServerBtn').className = (mode === 'server') ? 'tab-btn active' : 'tab-btn';
-      document.getElementById('tabPlutoBtn').className = (mode === 'pluto') ? 'tab-btn active' : 'tab-btn';
-    }
-
-    function updateSdrFreq() {
-      const sat = parseInt(document.getElementById('sdrSatInput').value, 10) || 1581;
-      const ch = sat % 18;
-      const freq = (916000000 + ch * 600000) / 1e6;
-      document.getElementById('sdrFreqLabel').innerText = `Freq: ${freq.toFixed(3)} MHz (Ch ${ch})`;
-    }
-
-    async function handleSdrToggle() {
-      const btn = document.getElementById('btnSdrStart');
-      if (isSdrActive) {
-        btn.disabled = true;
-        btn.innerText = '⏳ Stopping...';
-        await fetch('/api/sdr/receiver/stop', { method: 'POST' });
-        isSdrActive = false;
-        btn.innerText = '⚡ Start PlutoSDR RX';
-        btn.className = '';
-        btn.disabled = false;
-        checkStatus();
-      } else {
-        const sat = parseInt(document.getElementById('sdrSatInput').value, 10) || 1581;
-        const gain = parseFloat(document.getElementById('sdrGainSlider').value) || 40.0;
-        const bw = parseInt(document.getElementById('sdrBwInput').value, 10) || 500000;
-
-        btn.disabled = true;
-        btn.innerText = '⏳ Starting SDR...';
-
-        const res = await fetch('/api/sdr/receiver/start', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ sat, gain, bw, sf: 7, uri: 'usb:' })
-        });
-        const data = await res.json();
-        btn.disabled = false;
-
-        if (!res.ok) {
-          alert(data.error || 'Failed to start PlutoSDR');
-          btn.innerText = '⚡ Start PlutoSDR RX';
-          btn.className = '';
-        } else {
-          isSdrActive = true;
-          btn.innerText = '⏹️ Stop PlutoSDR RX';
-          btn.className = 'btn-danger';
-          if (!sseSource) initSSE();
-          checkStatus();
-        }
-      }
-    }
-
-    async function handleSdrTransmit(cmd) {
-      const sat = parseInt(document.getElementById('sdrSatInput').value, 10) || 1581;
-      const bw = parseInt(document.getElementById('sdrBwInput').value, 10) || 500000;
-
-      try {
-        const res = await fetch('/api/sdr/transmit', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ sat, command: cmd, bw, uri: 'usb:' })
-        });
-        const data = await res.json();
-        if (!res.ok) alert(data.error || 'PlutoSDR TX failed');
-        else console.log('PlutoSDR TX Response:', data);
-      } catch (e) {
-        alert('PlutoSDR TX Error: ' + e.message);
-      }
-    }
-
-    async function handleSdrWakeToggle() {
-      const btn = document.getElementById('btnSdrWake');
-      const sat = parseInt(document.getElementById('sdrSatInput').value, 10) || 1581;
-      const bw = parseInt(document.getElementById('sdrBwInput').value, 10) || 500000;
-
-      if (isSdrWakeActive) {
-        await fetch('/api/sdr/transmit', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ sat, command: 'stop_wake', bw, uri: 'usb:' })
-        });
-        isSdrWakeActive = false;
-        btn.innerText = '⚡ Hardware Wake Beacon (DMA Loop)';
-        btn.className = 'btn-secondary';
-      } else {
-        await fetch('/api/sdr/transmit', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ sat, command: 'wake', bw, uri: 'usb:' })
-        });
-        isSdrWakeActive = true;
-        btn.innerText = '⏹️ Stop Hardware Wake Beacon';
-        btn.className = 'btn-danger';
-      }
-    }
-
-
+    let clientCaptureStartTime = null;
     const receivedChunks = new Set();
 
-    function renderCameraChunk(chunk) {
-      document.getElementById('cameraProgressContainer').style.display = 'block';
-      const statusText = document.getElementById('cameraStatusText');
-      statusText.innerText = `Status: Receiving Chunk #${chunk.index}...`;
+    function showToast(msg) {
+      const t = document.getElementById('toast');
+      t.innerText = msg;
+      t.style.display = 'block';
+      setTimeout(() => { t.style.display = 'none'; }, 3000);
+    }
 
-      const details = document.getElementById('cameraProgressDetails');
-      details.innerText = `Block #${chunk.index} received (${(chunk.total_bytes / 1024).toFixed(1)} KB)`;
-
-      const speedMetric = document.getElementById('cameraSpeedMetric');
-      const rate = chunk.elapsed_seconds > 0 ? (chunk.total_blocks / chunk.elapsed_seconds).toFixed(1) : '0';
-      const speed = chunk.elapsed_seconds > 0 ? (chunk.total_bytes / chunk.elapsed_seconds).toFixed(0) : '0';
-      speedMetric.innerText = `Speed: ${speed} B/s | Rate: ${rate} blk/s | Elapsed: ${chunk.elapsed_seconds}s`;
-
-      // Interactive Matrix Grid (Strictly Sorted in Numerical Order)
-      const matrix = document.getElementById('chunkMatrix');
-      const countLabel = document.getElementById('chunkCountLabel');
-      
-      const badgeId = `chunk_blk_${chunk.index}`;
-      let badge = document.getElementById(badgeId);
-      if (!badge) {
-        badge = document.createElement('span');
-        badge.id = badgeId;
-        badge.setAttribute('data-index', chunk.index);
-        badge.className = 'chunk-badge';
-        badge.innerText = '#' + String(chunk.index).padStart(2, '0');
-        badge.title = `Block #${chunk.index} (${chunk.size} bytes)\\nOffset: 0x${(chunk.index * 240).toString(16).toUpperCase()}\\nHex: ${chunk.hex_preview}...`;
-        
-        // Insert in ascending numerical order
-        const children = Array.from(matrix.children);
-        let inserted = false;
-        for (let child of children) {
-          const childIdx = parseInt(child.getAttribute('data-index') || '-1', 10);
-          if (chunk.index < childIdx) {
-            matrix.insertBefore(badge, child);
-            inserted = true;
-            break;
-          }
+    // Check secure context on load
+    window.addEventListener('DOMContentLoaded', () => {
+      if (!('serial' in navigator)) {
+        if (location.protocol !== 'https:' && location.hostname !== 'localhost' && location.hostname !== '127.0.0.1') {
+          document.getElementById('secureNotice').style.display = 'block';
         }
-        if (!inserted) matrix.appendChild(badge);
-        receivedChunks.add(chunk.index);
+      }
+      initSSE();
+      checkBackendStatus();
+      setInterval(checkBackendStatus, 3000);
+    });
+
+    function updateStatusBadge(connected, satNum) {
+      const badge = document.getElementById('statusBadge');
+      const text = document.getElementById('statusText');
+      if (connected) {
+        badge.className = 'status-badge status-connected';
+        text.innerText = `Connected: Sat #${satNum || 1581}`;
       } else {
-        badge.className = 'chunk-badge duplicate';
+        badge.className = 'status-badge status-disconnected';
+        text.innerText = 'Disconnected';
       }
-      countLabel.innerText = `${receivedChunks.size} blocks received`;
-
-      // Progressive Live Image Rendering per block
-      if (chunk.partial_jpeg_base64) {
-        const img = document.getElementById('cameraImgPreview');
-        const placeholder = document.getElementById('cameraPlaceholder');
-        const meta = document.getElementById('cameraMetaInfo');
-
-        img.src = 'data:image/jpeg;base64,' + chunk.partial_jpeg_base64;
-        img.style.display = 'block';
-        placeholder.style.display = 'none';
-        meta.style.display = 'block';
-        meta.innerText = `[Progressive Reconstruction] Contiguous Blocks: 0..${(chunk.contiguous_blocks || chunk.total_blocks) - 1} | Buffer: ${(chunk.total_bytes / 1024).toFixed(1)} KB`;
-      }
-
-      // Progress bar estimation
-      const estTotalBlocks = Math.max(35, chunk.index + 5);
-      const pct = Math.min(95, Math.round((chunk.total_blocks / estTotalBlocks) * 100));
-      document.getElementById('cameraProgressBar').style.width = pct + '%';
-
-      // Log Stream
-      const log = document.getElementById('chunkStreamLog');
-      const logLine = document.createElement('div');
-      logLine.innerText = `[${chunk.elapsed_seconds.toFixed(2)}s] 📥 Block #${String(chunk.index).padStart(4, '0')} | ${chunk.size}B | Offset 0x${(chunk.index * 240).toString(16).toUpperCase()} | ${chunk.hex_preview}...`;
-      log.appendChild(logLine);
-      log.scrollTop = log.scrollHeight;
-    }
-
-    let clientCaptureStartTime = null;
-
-    async function triggerCameraCapture() {
-      const btn = document.getElementById('btnCameraCapture');
-      btn.disabled = true;
-      btn.innerText = '⏳ Triggering...';
-
-      // Reset chunks visualizer
-      receivedChunks.clear();
-      document.getElementById('chunkMatrix').innerHTML = '';
-      document.getElementById('chunkStreamLog').innerHTML = '';
-      document.getElementById('chunkCountLabel').innerText = '0 chunks';
-      document.getElementById('cameraProgressBar').style.width = '0%';
-      document.getElementById('cameraSpeedMetric').innerText = 'Speed: 0 B/s | Rate: 0 blk/s';
-      clientCaptureStartTime = Date.now();
-
-      try {
-        if (isClientConnected && clientPort && clientPort.writable) {
-          // Send camera trigger command to USB dongle: Port 0x13, Len 0x01, Payload 0x00
-          const writer = clientPort.writable.getWriter();
-          const cmd = new Uint8Array([0x13, 0x01, 0x00]);
-          await writer.write(cmd);
-          writer.releaseLock();
-
-          // Inform backend of client web serial capture session
-          await fetch('/api/camera/capture', {
-            method: 'POST',
-            headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify({ timeout: 35.0, source: 'client_web_serial' })
-          }).catch(console.warn);
-
-          document.getElementById('cameraProgressContainer').style.display = 'block';
-          document.getElementById('cameraStatusText').innerText = 'Status: Capturing via Web USB...';
-          btn.innerText = '📸 Capturing (Web USB)...';
-          if (cameraPollingInterval) clearInterval(cameraPollingInterval);
-          cameraPollingInterval = setInterval(pollCameraStatus, 800);
-          return;
-        }
-
-        const res = await fetch('/api/camera/capture', {
-          method: 'POST',
-          headers: {'Content-Type': 'application/json'},
-          body: JSON.stringify({ timeout: 35.0 })
-        });
-        const data = await res.json();
-        if (!res.ok) {
-          alert(data.error || 'Failed to trigger camera capture');
-          btn.disabled = false;
-          btn.innerText = '📸 Trigger Camera Capture';
-          return;
-        }
-        document.getElementById('cameraProgressContainer').style.display = 'block';
-        document.getElementById('cameraStatusText').innerText = 'Status: Capturing image...';
-        btn.innerText = '📸 Capturing...';
-        if (cameraPollingInterval) clearInterval(cameraPollingInterval);
-        cameraPollingInterval = setInterval(pollCameraStatus, 800);
-      } catch (err) {
-        alert('Camera request error: ' + err.message);
-        btn.disabled = false;
-        btn.innerText = '📸 Trigger Camera Capture';
-      }
-    }
-
-    async function pollCameraStatus() {
-      try {
-        const res = await fetch('/api/camera/status');
-        const data = await res.json();
-        const btn = document.getElementById('btnCameraCapture');
-        const statusText = document.getElementById('cameraStatusText');
-        const progDetails = document.getElementById('cameraProgressDetails');
-
-        if (data.status === 'capturing') {
-          statusText.innerText = `Status: Capturing (${data.progress.elapsed_seconds}s)`;
-          progDetails.innerText = `Blocks received: ${data.progress.blocks_received} (${(data.progress.total_bytes / 1024).toFixed(1)} KB)`;
-          if (data.progress.transfer_speed_bps) {
-            document.getElementById('cameraSpeedMetric').innerText = `Speed: ${data.progress.transfer_speed_bps} B/s | Elapsed: ${data.progress.elapsed_seconds}s`;
-          }
-          if (data.chunks && data.chunks.length > 0) {
-            data.chunks.forEach(chunk => renderCameraChunk(chunk));
-          }
-        } else if (data.status === 'completed') {
-          clearInterval(cameraPollingInterval);
-          cameraPollingInterval = null;
-          btn.disabled = false;
-          btn.innerText = '📸 Trigger Camera Capture';
-          statusText.innerText = 'Status: Capture Complete! 🎉';
-          document.getElementById('cameraProgressBar').style.width = '100%';
-          loadLatestCameraImage();
-        } else if (data.status === 'failed') {
-          clearInterval(cameraPollingInterval);
-          cameraPollingInterval = null;
-          btn.disabled = false;
-          btn.innerText = '📸 Trigger Camera Capture';
-          statusText.innerText = `Status: Failed (${data.progress.error || 'Timeout'})`;
-        }
-      } catch (e) {}
-    }
-
-    async function loadLatestCameraImage() {
-      try {
-        const res = await fetch('/api/camera/latest');
-        if (!res.ok) return;
-        const data = await res.json();
-        const img = document.getElementById('cameraImgPreview');
-        const placeholder = document.getElementById('cameraPlaceholder');
-        const meta = document.getElementById('cameraMetaInfo');
-
-        img.src = `/api/camera/latest.jpg?t=${Date.now()}`;
-        img.style.display = 'block';
-        placeholder.style.display = 'none';
-        meta.style.display = 'block';
-        meta.innerText = `Size: ${(data.metadata.byte_length / 1024).toFixed(1)} KB | Blocks: ${data.metadata.block_count} | Duration: ${data.metadata.capture_duration_seconds}s`;
-      } catch (e) {}
-    }
-
-    function initSSE() {
-      sseSource = new EventSource('/api/telemetry/stream');
-      sseSource.onmessage = (event) => {
-        try {
-          const data = JSON.parse(event.data);
-          if (data.type === 'camera_chunk') {
-            renderCameraChunk(data);
-          } else {
-            renderTelemetry(data);
-          }
-        } catch (e) {}
-      };
-      sseSource.onerror = () => {
-        if (sseSource) { sseSource.close(); sseSource = null; }
-      };
-    }
-
-
-    function renderTelemetry(data) {
-      document.getElementById('valSeq').innerText = '#' + data.packet_sequence;
-      document.getElementById('valUptime').innerText = (data.device_uptime_ms / 1000).toFixed(1) + 's uptime';
-      document.getElementById('valTemp').innerText = data.barometer.temperature_c.toFixed(1) + ' °C';
-      document.getElementById('valPres').innerText = data.barometer.pressure_hpa.toFixed(1) + ' hPa (' + data.barometer.altitude_m.toFixed(1) + 'm)';
-      document.getElementById('valBatt').innerText = data.eps.battery_charge.bus_voltage_v.toFixed(2) + ' V';
-      document.getElementById('valRails').innerText = '5V: ' + data.eps.main_5v_v.toFixed(2) + 'V | 3.3V: ' + data.eps.main_3v3_v.toFixed(2) + 'V';
-      document.getElementById('valGpsCoords').innerText = data.gps.latitude.toFixed(4) + ', ' + data.gps.longitude.toFixed(4);
-      document.getElementById('valGpsStatus').innerText = (data.gps.fix ? 'Fix OK' : 'No Fix') + ' (' + data.gps.satellites + ' sats)';
-      document.getElementById('valAccel').innerText = data.imu.accelerometer_g.x.toFixed(2) + ', ' + data.imu.accelerometer_g.y.toFixed(2) + ', ' + data.imu.accelerometer_g.z.toFixed(2);
-      document.getElementById('valSignal').innerText = data.receiver_rssi.toFixed(1) + ' dBm';
-      document.getElementById('valSnr').innerText = 'SNR: ' + data.receiver_snr.toFixed(2) + ' dB';
-      document.getElementById('jsonDisplay').innerText = JSON.stringify(data, null, 2);
     }
 
     async function handleClientWebSerial() {
@@ -1859,13 +791,19 @@ HTML_DASHBOARD = """<!DOCTYPE html>
         clientReader = null;
         document.getElementById('btnClientConnect').innerText = '🔌 Connect Browser USB';
         document.getElementById('btnClientConnect').className = '';
-        checkStatus();
+        updateStatusBadge(false);
+        fetch('/api/status', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({ is_connected: false })
+        }).catch(() => {});
+        showToast('USB Receiver terputus.');
         return;
       }
 
       if (!('serial' in navigator)) {
         if (location.protocol !== 'https:' && location.hostname !== 'localhost' && location.hostname !== '127.0.0.1') {
-          alert('🔒 Web Serial API mewajibkan "Secure Context" (HTTPS atau localhost) oleh standar keamanan Chrome/Edge.\\n\\nKarena Anda mengakses via IP (' + location.origin + '):\\n1. Buka tab baru di Chrome: chrome://flags/#unsafely-treat-insecure-origin-as-secure\\n2. Ubah menjadi "Enabled"\\n3. Masukkan URL: ' + location.origin + '\\n4. Klik tombol "Relaunch" di kanan bawah.\\n\\nSetelah Chrome restart, Web USB akan aktif penuh!');
+          alert('🔒 Web Serial API mewajibkan "Secure Context" (HTTPS atau localhost) oleh standar keamanan browser.\\n\\nKarena Anda mengakses via IP (' + location.origin + '):\\n1. Buka tab baru di browser: chrome://flags/#unsafely-treat-insecure-origin-as-secure\\n2. Ubah menjadi "Enabled"\\n3. Masukkan URL: ' + location.origin + '\\n4. Klik tombol "Relaunch" di kanan bawah.\\n\\nSetelah itu, Web Serial akan aktif penuh!');
         } else {
           alert('Browser Anda belum mendukung Web Serial API. Silakan gunakan Google Chrome, Edge, atau Opera.');
         }
@@ -1894,15 +832,99 @@ HTML_DASHBOARD = """<!DOCTYPE html>
         isClientConnected = true;
         document.getElementById('btnClientConnect').innerText = 'Disconnect Browser USB';
         document.getElementById('btnClientConnect').className = 'btn-danger';
+        updateStatusBadge(true, satNum);
 
-        const badge = document.getElementById('statusBadge');
-        const text = document.getElementById('statusText');
-        badge.className = 'status-badge status-client';
-        text.innerText = `Client USB: Sat #${satNum}`;
+        fetch('/api/status', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({ is_connected: true, serial_number: satNum, source: 'client_web_serial' })
+        }).catch(() => {});
 
+        showToast(`Terhubung ke Satelit #${satNum} via Web Serial!`);
         readClientSerialLoop();
       } catch (err) {
         alert('Koneksi Web Serial gagal: ' + err.message);
+      }
+    }
+
+    async function sendClientCommand(portByte, payloadBytes = []) {
+      if (!isClientConnected || !clientPort || !clientPort.writable) {
+        alert('Harap hubungkan Browser USB / Serial terlebih dahulu!');
+        return false;
+      }
+      try {
+        const frame = new Uint8Array(2 + payloadBytes.length);
+        frame[0] = portByte;
+        frame[1] = payloadBytes.length;
+        if (payloadBytes.length > 0) {
+          frame.set(payloadBytes, 2);
+        }
+        const writer = clientPort.writable.getWriter();
+        await writer.write(frame);
+        writer.releaseLock();
+        return true;
+      } catch (err) {
+        alert('Gagal mengirim perintah: ' + err.message);
+        return false;
+      }
+    }
+
+    async function sendBlinkLed() {
+      const ok = await sendClientCommand(0x80, [0xFF, 0x00, 0x00]); // Red LED
+      if (ok) showToast('💡 Perintah Blink RGB LED terkirim ke satelit!');
+    }
+
+    async function sendStartupSong() {
+      const ok = await sendClientCommand(0x84, [0x00]); // Startup Song
+      if (ok) showToast('🎵 Perintah Play Startup Song terkirim ke satelit!');
+    }
+
+    async function sendPing() {
+      const ok = await sendClientCommand(0x12, [0x00]); // OBC Info / Ping
+      if (ok) showToast('📡 Perintah Ping (OBC Info) terkirim ke satelit!');
+    }
+
+    async function triggerCameraCapture() {
+      if (!isClientConnected || !clientPort || !clientPort.writable) {
+        alert('Harap hubungkan Browser USB / Serial terlebih dahulu untuk mengambil foto satelit!');
+        return;
+      }
+      const btn = document.getElementById('btnCameraCapture');
+      btn.disabled = true;
+      btn.innerText = '⏳ Triggering...';
+
+      // Reset visualizer
+      receivedChunks.clear();
+      document.getElementById('chunkMatrix').innerHTML = '';
+      document.getElementById('chunkStreamLog').innerHTML = '';
+      document.getElementById('chunkCountLabel').innerText = '0 chunks';
+      document.getElementById('cameraProgressBar').style.width = '0%';
+      document.getElementById('cameraSpeedMetric').innerText = 'Speed: 0 B/s | Rate: 0 blk/s';
+      clientCaptureStartTime = Date.now();
+
+      try {
+        const ok = await sendClientCommand(0x13, [0x00]); // HostPort.OBC_CAMERA
+        if (!ok) {
+          btn.disabled = false;
+          btn.innerText = '📸 Trigger Camera Capture';
+          return;
+        }
+
+        await fetch('/api/camera/capture', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({ timeout: 35.0, source: 'client_web_serial' })
+        }).catch(console.warn);
+
+        document.getElementById('cameraProgressContainer').style.display = 'block';
+        document.getElementById('cameraStatusText').innerText = 'Status: Capturing via Web USB...';
+        btn.innerText = '📸 Capturing (Web USB)...';
+        if (cameraPollingInterval) clearInterval(cameraPollingInterval);
+        cameraPollingInterval = setInterval(pollCameraStatus, 800);
+      } catch (err) {
+        alert('Camera request error: ' + err.message);
+        btn.disabled = false;
+        btn.innerText = '📸 Trigger Camera Capture';
       }
     }
 
@@ -1928,7 +950,7 @@ HTML_DASHBOARD = """<!DOCTYPE html>
 
                 const isCameraBlock = (port === 0x15 || port === 0x20) && len === 242;
                 const isTelemetry = (port === 0x10) && len === 121;
-                const isControl = (port === 0x00 || port === 0x01 || port === 0x02 || port === 0x03 || port === 0x0A || port === 0x12 || port === 0x13 || port === 0x80);
+                const isControl = (port === 0x00 || port === 0x01 || port === 0x02 || port === 0x03 || port === 0x0A || port === 0x12 || port === 0x13 || port === 0x80 || port === 0x84);
 
                 if (isCameraBlock || isTelemetry || isControl) {
                   if (buffer.length < frameLen) {
@@ -1949,7 +971,6 @@ HTML_DASHBOARD = """<!DOCTYPE html>
                     .then(res => { if (res.telemetry) renderTelemetry(res.telemetry); })
                     .catch(console.error);
                   } else if (isCameraBlock) {
-                    // Extract block info immediately for instant zero-latency UI rendering
                     const blockIdx = frame[2] | (frame[3] << 8);
                     const chunkSize = frame.length - 4;
                     const hexPreview = Array.from(frame.slice(4, 12)).map(b => b.toString(16).padStart(2, '0')).join('').toUpperCase();
@@ -1964,7 +985,6 @@ HTML_DASHBOARD = """<!DOCTYPE html>
                       elapsed_seconds: elapsed
                     });
 
-                    // Ingest to backend in background and update progressive JPEG preview
                     fetch('/api/camera/chunk/ingest', {
                       method: 'POST',
                       headers: { 'Content-Type': 'application/json' },
@@ -1974,7 +994,11 @@ HTML_DASHBOARD = """<!DOCTYPE html>
                     .then(res => {
                       if (res.chunk && res.chunk.partial_jpeg_base64) {
                         const img = document.getElementById('cameraImgPreview');
-                        if (img) img.src = 'data:image/jpeg;base64,' + res.chunk.partial_jpeg_base64;
+                        if (img) {
+                          img.src = 'data:image/jpeg;base64,' + res.chunk.partial_jpeg_base64;
+                          img.style.display = 'block';
+                          document.getElementById('cameraPlaceholder').style.display = 'none';
+                        }
                       }
                     })
                     .catch(console.error);
@@ -1997,133 +1021,139 @@ HTML_DASHBOARD = """<!DOCTYPE html>
       }
     }
 
-    async function loadPorts() {
-      const res = await fetch('/api/ports');
-      const data = await res.json();
-      const sel = document.getElementById('portSelect');
-      sel.innerHTML = '';
-      data.ports.forEach(p => {
-        const opt = document.createElement('option');
-        opt.value = p.device;
-        opt.innerText = p.device + (p.description ? ' - ' + p.description : '');
-        if (p.is_rascube) opt.selected = true;
-        sel.appendChild(opt);
-      });
+    function renderCameraChunk(chunk) {
+      if (!receivedChunks.has(chunk.index)) {
+        receivedChunks.add(chunk.index);
+        const matrix = document.getElementById('chunkMatrix');
+        const badge = document.createElement('span');
+        badge.className = 'chunk-badge';
+        badge.id = `chunk-blk-${chunk.index}`;
+        badge.innerText = `#${chunk.index}`;
+        badge.title = `Block ${chunk.index} (${chunk.size} bytes)`;
+        matrix.appendChild(badge);
+        document.getElementById('chunkCountLabel').innerText = `${receivedChunks.size} chunks`;
+      }
+
+      const streamLog = document.getElementById('chunkStreamLog');
+      const logLine = document.createElement('div');
+      logLine.innerText = `[${new Date().toLocaleTimeString()}] Block #${chunk.index} | Size: ${chunk.size}B | Hex: ${chunk.hex_preview}...`;
+      streamLog.prepend(logLine);
+
+      const estimatedTotal = 75;
+      const pct = Math.min(98, Math.round((receivedChunks.size / estimatedTotal) * 100));
+      document.getElementById('cameraProgressBar').style.width = pct + '%';
+      document.getElementById('cameraProgressDetails').innerText = `Received ${receivedChunks.size} blocks (${chunk.total_bytes} bytes)`;
+      if (chunk.elapsed_seconds > 0) {
+        const bps = Math.round(chunk.total_bytes / chunk.elapsed_seconds);
+        const rate = (receivedChunks.size / chunk.elapsed_seconds).toFixed(1);
+        document.getElementById('cameraSpeedMetric').innerText = `Speed: ${bps} B/s | Rate: ${rate} blk/s | ${chunk.elapsed_seconds.toFixed(1)}s`;
+      }
     }
 
-    async function checkStatus() {
-      if (isClientConnected) return; // Do not overwrite client UI state
-
-      const res = await fetch('/api/status');
-      const data = await res.json();
-      isConnected = data.is_connected;
-      const badge = document.getElementById('statusBadge');
-      const text = document.getElementById('statusText');
-      const btn = document.getElementById('btnConnect');
-
-      // Check SDR status
+    async function pollCameraStatus() {
       try {
-        const sdrRes = await fetch('/api/sdr/status');
-        const sdrData = await sdrRes.json();
-        isSdrActive = sdrData.active;
-        isSdrWakeActive = sdrData.cyclic_beacon_active;
-        const sdrBtn = document.getElementById('btnSdrStart');
-        const wakeBtn = document.getElementById('btnSdrWake');
+        const res = await fetch('/api/camera/status');
+        const data = await res.json();
+        const statusText = document.getElementById('cameraStatusText');
+        const progressBar = document.getElementById('cameraProgressBar');
 
-        if (isSdrActive) {
-          sdrBtn.innerText = '⏹️ Stop PlutoSDR RX';
-          sdrBtn.className = 'btn-danger';
-        } else {
-          sdrBtn.innerText = '⚡ Start PlutoSDR RX';
-          sdrBtn.className = '';
-        }
-
-        if (isSdrWakeActive) {
-          wakeBtn.innerText = '⏹️ Stop Hardware Wake Beacon';
-          wakeBtn.className = 'btn-danger';
-        } else {
-          wakeBtn.innerText = '⚡ Hardware Wake Beacon (DMA Loop)';
-          wakeBtn.className = 'btn-secondary';
+        if (data.status === 'capturing') {
+          const blocks = data.progress.blocks_received || receivedChunks.size || 0;
+          statusText.innerText = `Status: Capturing (${blocks} blocks)...`;
+        } else if (data.status === 'completed') {
+          if (cameraPollingInterval) clearInterval(cameraPollingInterval);
+          cameraPollingInterval = null;
+          statusText.innerText = `Status: Complete (${data.metadata ? data.metadata.block_count : 0} blocks)`;
+          progressBar.style.width = '100%';
+          const btn = document.getElementById('btnCameraCapture');
+          btn.disabled = false;
+          btn.innerText = '📸 Trigger Camera Capture';
+          fetchLatestCameraImage();
+        } else if (data.status === 'failed') {
+          if (cameraPollingInterval) clearInterval(cameraPollingInterval);
+          cameraPollingInterval = null;
+          statusText.innerText = `Status: Failed (${data.progress.error || 'Unknown error'})`;
+          const btn = document.getElementById('btnCameraCapture');
+          btn.disabled = false;
+          btn.innerText = '📸 Trigger Camera Capture';
         }
       } catch (e) {}
-
-      if (isConnected) {
-        badge.className = 'status-badge status-connected';
-        text.innerText = `${data.connected_port} (#${data.serial_number})`;
-        if (data.connected_port && data.connected_port.includes('PlutoSDR')) {
-          btn.innerText = '⚡ Connect Dongle';
-          btn.className = '';
-        } else {
-          btn.innerText = 'Disconnect';
-          btn.className = 'btn-danger';
-        }
-        if (!sseSource) initSSE();
-      } else {
-        badge.className = 'status-badge status-disconnected';
-        text.innerText = data.error_message ? `Error: ${data.error_message}` : 'Disconnected';
-        btn.innerText = '⚡ Connect Dongle';
-        btn.className = '';
-      }
     }
 
-    async function handleConnect() {
-      if (isConnected) {
-        await fetch('/api/disconnect', { method: 'POST' });
-        if (sseSource) { sseSource.close(); sseSource = null; }
-        checkStatus();
-      } else {
-        const port = document.getElementById('portSelect').value;
-        const serial_number = parseInt(document.getElementById('serialInput').value);
-        const res = await fetch('/api/connect', {
-          method: 'POST',
-          headers: {'Content-Type': 'application/json'},
-          body: JSON.stringify({ port, serial_number })
-        });
+    async function fetchLatestCameraImage() {
+      try {
+        const res = await fetch('/api/camera/latest');
+        if (!res.ok) return;
         const data = await res.json();
-        if (!res.ok) alert(data.error || 'Connection failed');
-        setTimeout(checkStatus, 500);
-      }
+        const img = document.getElementById('cameraImgPreview');
+        const meta = document.getElementById('cameraMetaInfo');
+        const placeholder = document.getElementById('cameraPlaceholder');
+
+        if (data.jpeg_base64) {
+          img.src = 'data:image/jpeg;base64,' + data.jpeg_base64;
+          img.style.display = 'block';
+          placeholder.style.display = 'none';
+
+          if (data.metadata) {
+            meta.style.display = 'block';
+            meta.innerText = `Size: ${data.metadata.byte_length} bytes | Blocks: ${data.metadata.block_count} | Duration: ${data.metadata.capture_duration_seconds}s`;
+          }
+        }
+      } catch (e) {}
     }
 
-    loadPorts();
-    checkStatus();
-    loadLatestCameraImage();
-    setInterval(checkStatus, 3000);
+    function renderTelemetry(data) {
+      if (!data) return;
+      document.getElementById('valSeq').innerText = '#' + (data.packet_sequence ?? '-');
+      document.getElementById('valUptime').innerText = 'Uptime: ' + (data.uptime_seconds != null ? data.uptime_seconds + 's' : '-');
+      document.getElementById('valTemp').innerText = (data.environment && data.environment.temperature_c != null) ? data.environment.temperature_c.toFixed(1) + ' °C' : '-';
+      document.getElementById('valPres').innerText = (data.environment && data.environment.pressure_hpa != null) ? data.environment.pressure_hpa.toFixed(1) + ' hPa' : '-';
+      document.getElementById('valBatt').innerText = (data.eps && data.eps.battery_charge) ? data.eps.battery_charge.bus_voltage_v.toFixed(2) + ' V' : '-';
+      document.getElementById('valRails').innerText = (data.eps) ? `5V: ${data.eps.main_5v_v.toFixed(2)}V | 3.3V: ${data.eps.main_3v3_v.toFixed(2)}V` : '-';
+      document.getElementById('valGpsCoords').innerText = (data.gps) ? `${data.gps.latitude.toFixed(4)}, ${data.gps.longitude.toFixed(4)}` : '-';
+      document.getElementById('valGpsStatus').innerText = (data.gps) ? `${data.gps.fix ? 'Fix OK' : 'No Fix'} (${data.gps.satellites} sats)` : '-';
+      document.getElementById('valAccel').innerText = (data.imu && data.imu.accelerometer_g) ? `${data.imu.accelerometer_g.x.toFixed(2)}, ${data.imu.accelerometer_g.y.toFixed(2)}, ${data.imu.accelerometer_g.z.toFixed(2)}` : '-';
+      document.getElementById('valSignal').innerText = (data.receiver_rssi != null) ? data.receiver_rssi.toFixed(1) + ' dBm' : '-';
+      document.getElementById('valSnr').innerText = (data.receiver_snr != null) ? 'SNR: ' + data.receiver_snr.toFixed(2) + ' dB' : '-';
+      document.getElementById('jsonDisplay').innerText = JSON.stringify(data, null, 2);
+    }
+
+    function initSSE() {
+      if (sseSource) sseSource.close();
+      sseSource = new EventSource('/api/telemetry/stream');
+      sseSource.onmessage = (e) => {
+        try {
+          const item = JSON.parse(e.data);
+          if (item.type === 'camera_chunk') {
+            renderCameraChunk(item);
+          } else {
+            renderTelemetry(item);
+          }
+        } catch (err) {}
+      };
+      sseSource.onerror = () => {
+        // SSE reconnects automatically
+      };
+    }
+
+    async function checkBackendStatus() {
+      if (isClientConnected) return;
+      try {
+        const res = await fetch('/api/status');
+        const data = await res.json();
+        updateStatusBadge(data.is_connected, data.serial_number);
+      } catch (e) {}
+    }
   </script>
 </body>
 </html>
 """
 
 
+# --- HTTP Request Handler ---
 class GroundStationAPIHandler(BaseHTTPRequestHandler):
-    def handle_one_request(self) -> None:
-        try:
-            super().handle_one_request()
-        except (ConnectionResetError, BrokenPipeError):
-            self.close_connection = True
-        except Exception as exc:
-            self.close_connection = True
-
-    def log_error(self, format: str, *args: Any) -> None:
-        # Ignore ConnectionResetError / BrokenPipeError in standard HTTP logger
-        msg = format % args
-        if "Connection reset by peer" in msg or "Broken pipe" in msg:
-            return
-        super().log_error(format, *args)
-
     def _send_json(self, status: int, data: Any) -> None:
-        def _json_default(obj: Any) -> Any:
-            if isinstance(obj, (set, frozenset)):
-                return list(obj)
-            if dataclasses.is_dataclass(obj):
-                return dataclasses.asdict(obj)
-            if hasattr(obj, "isoformat"):
-                return obj.isoformat()
-            if isinstance(obj, bytes):
-                return obj.hex().upper()
-            return str(obj)
-
-        body = json.dumps(data, indent=2, default=_json_default).encode("utf-8")
+        body = json.dumps(data, indent=2).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
@@ -2139,6 +1169,9 @@ class GroundStationAPIHandler(BaseHTTPRequestHandler):
         self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
         self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization")
         self.end_headers()
+
+    def do_HEAD(self) -> None:
+        self.do_GET()
 
     def do_GET(self) -> None:
         parsed = urllib.parse.urlparse(self.path)
@@ -2176,51 +1209,35 @@ class GroundStationAPIHandler(BaseHTTPRequestHandler):
             self.wfile.write(body)
             return
 
-        # 4. List Available COM Ports
-        if path == "/api/ports":
-            ports_list = []
-            for p in list_ports.comports():
-                is_ras = (p.vid == USB_VID and p.pid == USB_PID_V2)
-                ports_list.append({
-                    "device": p.device,
-                    "description": p.description,
-                    "vid": p.vid,
-                    "pid": p.pid,
-                    "serial_number": p.serial_number,
-                    "is_rascube": is_ras,
-                })
-            self._send_json(HTTPStatus.OK, {"ports": ports_list})
-            return
-
-        # 5. Connection Status
+        # 4. Connection & Ground Station Status
         if path == "/api/status":
             with state.lock:
                 status_data = {
                     "is_connected": state.is_connected,
-                    "connected_port": state.connected_port,
+                    "mode": "client_web_serial",
+                    "connected_port": state.connected_port or ("Client Web USB/Serial (Browser)" if state.is_connected else None),
                     "serial_number": state.serial_number,
-                    "receiver_info": state.receiver_info,
-                    "obc_info": state.obc_info,
                     "total_samples_received": state.total_samples_received,
                     "last_received_time": state.last_received_time,
+                    "camera_status": state.camera_status,
                     "error_message": state.error_message,
                 }
             self._send_json(HTTPStatus.OK, status_data)
             return
 
-        # 6. Latest Telemetry
+        # 5. Latest Telemetry Snapshot
         if path == "/api/telemetry/latest":
             with state.lock:
                 if state.latest_sample is None:
                     self._send_json(
                         HTTPStatus.SERVICE_UNAVAILABLE,
-                        {"error": "No telemetry data received yet"},
+                        {"error": "No telemetry data received yet. Connect via Web Serial in dashboard."},
                     )
                     return
                 self._send_json(HTTPStatus.OK, state.latest_sample)
             return
 
-        # 7. Telemetry History Buffer
+        # 6. Telemetry History Buffer
         if path == "/api/telemetry/history":
             limit = int(query.get("limit", [50])[0])
             with state.lock:
@@ -2228,7 +1245,7 @@ class GroundStationAPIHandler(BaseHTTPRequestHandler):
             self._send_json(HTTPStatus.OK, {"count": len(items), "samples": items})
             return
 
-        # 8. Realtime Server-Sent Events (SSE) Stream
+        # 7. Realtime Server-Sent Events (SSE) Stream
         if path == "/api/telemetry/stream":
             self.send_response(HTTPStatus.OK)
             self.send_header("Content-Type", "text/event-stream")
@@ -2246,7 +1263,6 @@ class GroundStationAPIHandler(BaseHTTPRequestHandler):
                         self.wfile.write(msg)
                         self.wfile.flush()
                     except queue.Empty:
-                        # Keep-alive comment
                         self.wfile.write(b": ping\n\n")
                         self.wfile.flush()
             except (BrokenPipeError, ConnectionResetError):
@@ -2255,7 +1271,7 @@ class GroundStationAPIHandler(BaseHTTPRequestHandler):
                 state.remove_subscriber(sub_queue)
             return
 
-        # 9. Manual Decode via Query Parameter
+        # 8. Manual Decode via Query Parameter
         if path == "/api/decode":
             hex_data = query.get("hex", [""])[0]
             if not hex_data:
@@ -2268,7 +1284,7 @@ class GroundStationAPIHandler(BaseHTTPRequestHandler):
                 self._send_json(HTTPStatus.UNPROCESSABLE_ENTITY, {"error": str(exc)})
             return
 
-        # 10. Camera Capture Status
+        # 9. Camera Capture Status
         if path == "/api/camera/status":
             with state.lock:
                 self._send_json(HTTPStatus.OK, {
@@ -2281,7 +1297,7 @@ class GroundStationAPIHandler(BaseHTTPRequestHandler):
                 })
             return
 
-        # 11. Latest Camera Image (JSON & Base64)
+        # 10. Latest Camera Image (JSON & Base64)
         if path == "/api/camera/latest":
             with state.lock:
                 if state.latest_image is None:
@@ -2295,7 +1311,7 @@ class GroundStationAPIHandler(BaseHTTPRequestHandler):
                 })
             return
 
-        # 12. Latest Camera Image (Raw JPEG Binary)
+        # 11. Latest Camera Image (Raw JPEG Binary)
         if path in ("/api/camera/latest.jpg", "/api/camera/image", "/api/camera/partial.jpg"):
             with state.lock:
                 img_data = state.latest_image or state.partial_image
@@ -2311,23 +1327,12 @@ class GroundStationAPIHandler(BaseHTTPRequestHandler):
             self.wfile.write(img_data)
             return
 
-        # 13. PlutoSDR Ground Station Status
-        if path == "/api/sdr/status":
-            with state.lock:
-                self._send_json(HTTPStatus.OK, {
-                    "active": state.sdr_active,
-                    "sat": state.sdr_sat,
-                    "frequency_hz": 916_000_000 + (state.sdr_sat % 18) * 600_000,
-                    "gain_db": state.sdr_gain,
-                    "sf": state.sdr_sf,
-                    "bw_hz": state.sdr_bw,
-                    "uri": state.sdr_uri,
-                    "packets_decoded": state.sdr_packets_count,
-                    "last_rssi_dbm": state.sdr_last_rssi,
-                    "last_snr_db": state.sdr_last_snr,
-                    "cyclic_beacon_active": state.sdr_cyclic_active,
-                    "error": state.sdr_error,
-                })
+        # Legacy / Informational endpoints
+        if path == "/api/ports":
+            self._send_json(HTTPStatus.OK, {
+                "ports": [],
+                "notice": "Server COM scanning disabled. Ground station uses Client Web USB/Serial only."
+            })
             return
 
         self._send_json(HTTPStatus.NOT_FOUND, {"error": "Endpoint not found"})
@@ -2343,61 +1348,25 @@ class GroundStationAPIHandler(BaseHTTPRequestHandler):
         except json.JSONDecodeError:
             body_json = {}
 
-        # 1. Connect to Port & Set Satellite Serial Number (Server Host USB)
-        if path == "/api/connect":
-            port = body_json.get("port")
-            serial_number = body_json.get("serial_number")
-
-            if not port or serial_number is None:
-                self._send_json(
-                    HTTPStatus.BAD_REQUEST,
-                    {"error": "Missing 'port' or 'serial_number' in request body"},
-                )
-                return
-
-            try:
-                serial_number = int(serial_number)
-            except ValueError:
-                self._send_json(HTTPStatus.BAD_REQUEST, {"error": "'serial_number' must be an integer"})
-                return
-
+        # 1. Update Connection Status from Client Browser
+        if path == "/api/status":
+            conn = bool(body_json.get("is_connected", True))
+            sat = int(body_json.get("serial_number", state.serial_number))
+            source = str(body_json.get("source", "client_web_serial"))
             with state.lock:
-                if state.is_connected:
-                    state.stop_signal.set()
-                    time.sleep(0.3)
-
-                state.stop_signal.clear()
-                state.error_message = None
-                worker = threading.Thread(
-                    target=background_telemetry_loop,
-                    args=(port, serial_number),
-                    daemon=True,
-                )
-                state.worker_thread = worker
-                worker.start()
-
-            # Wait briefly for connection handshake
-            time.sleep(0.6)
-            with state.lock:
-                self._send_json(HTTPStatus.OK, {
-                    "status": "connecting" if not state.is_connected else "connected",
-                    "port": port,
-                    "serial_number": serial_number,
-                    "receiver_info": state.receiver_info,
-                    "obc_info": state.obc_info,
-                    "error": state.error_message,
-                })
+                state.is_connected = conn
+                state.connected_source = source if conn else None
+                state.serial_number = sat
+                state.connected_port = "Client Web USB/Serial (Browser)" if conn else None
+            self._send_json(HTTPStatus.OK, {
+                "status": "updated",
+                "is_connected": state.is_connected,
+                "serial_number": state.serial_number,
+                "source": state.connected_source,
+            })
             return
 
-        # 2. Disconnect (Server Host USB)
-        if path == "/api/disconnect":
-            with state.lock:
-                state.stop_signal.set()
-                state.is_connected = False
-            self._send_json(HTTPStatus.OK, {"status": "disconnected"})
-            return
-
-        # 3. Ingest Telemetry or Camera Chunks from Client Web Serial
+        # 2. Ingest Telemetry or Camera Chunks from Client Web Serial
         if path in ("/api/telemetry/ingest", "/api/camera/chunk/ingest"):
             hex_data = body_json.get("hex") or body_json.get("payload") or raw_body.strip().strip('"')
             if not hex_data:
@@ -2407,7 +1376,7 @@ class GroundStationAPIHandler(BaseHTTPRequestHandler):
                 raw_bytes = bytes.fromhex(hex_data)
                 port = raw_bytes[0] if len(raw_bytes) > 0 else None
 
-                # Check if it's a Camera Block (InboundPort.JPEG_CAMERA = 0x15 or 0x20)
+                # Camera Block (InboundPort.JPEG_CAMERA = 0x15 or 0x20)
                 if port in (0x15, 0x20):
                     payload = raw_bytes[2:] if len(raw_bytes) > 2 else raw_bytes
                     if len(payload) >= 2:
@@ -2427,7 +1396,6 @@ class GroundStationAPIHandler(BaseHTTPRequestHandler):
                             state.camera_progress["transfer_speed_bps"] = speed
 
                             state.camera_blocks[blk_idx] = blk_data
-                            # Assemble contiguous progressive blocks sorted strictly: 0, 1, 2, ...
                             contiguous = bytearray()
                             idx = 0
                             while idx in state.camera_blocks:
@@ -2474,38 +1442,39 @@ class GroundStationAPIHandler(BaseHTTPRequestHandler):
                         self._send_json(HTTPStatus.OK, {"status": "camera_chunk_ingested", "chunk": chunk_record})
                         return
 
-                # Otherwise standard Telemetry (0x10)
+                # Standard Telemetry Frame (0x10)
                 decoded = decode_telemetry_to_dict(hex_data)
                 decoded["raw_hex"] = hex_data if isinstance(hex_data, str) else hex_data.hex().upper()
                 decoded["timestamp"] = time.time()
                 decoded["source"] = body_json.get("source", "client_web_serial")
+                with state.lock:
+                    state.is_connected = True
+                    state.connected_source = "client_web_serial"
                 state.broadcast_telemetry(decoded)
                 self._send_json(HTTPStatus.OK, {"status": "ingested", "telemetry": decoded})
             except (ProtocolDecodeError, ValueError) as exc:
                 self._send_json(HTTPStatus.UNPROCESSABLE_ENTITY, {"error": str(exc)})
             return
 
-        # 4. Trigger Camera Capture
+        # 3. Trigger Camera Capture Session
         if path == "/api/camera/capture":
             timeout_val = float(body_json.get("timeout", 35.0))
-            source_val = str(body_json.get("source", "server"))
+            source_val = str(body_json.get("source", "client_web_serial"))
             try:
                 trigger_camera_capture(timeout=timeout_val, source=source_val)
                 self._send_json(HTTPStatus.ACCEPTED, {
                     "status": "capturing",
                     "source": source_val,
-                    "message": f"Camera capture initiated with {timeout_val:.1f}s timeout",
+                    "message": f"Camera capture session initiated (awaiting chunks from Web Serial)",
                     "check_status_url": "/api/camera/status",
                 })
             except SessionBusyError as exc:
                 self._send_json(HTTPStatus.CONFLICT, {"error": str(exc)})
-            except (ConnectionError, RuntimeError) as exc:
-                self._send_json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": str(exc)})
             except Exception as exc:
                 self._send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(exc)})
             return
 
-        # 5. Decode HEX Body
+        # 4. Standalone HEX Decode
         if path == "/api/decode":
             hex_data = body_json.get("hex") or body_json.get("payload") or raw_body.strip().strip('"')
             if not hex_data:
@@ -2518,67 +1487,12 @@ class GroundStationAPIHandler(BaseHTTPRequestHandler):
                 self._send_json(HTTPStatus.UNPROCESSABLE_ENTITY, {"error": str(exc)})
             return
 
-        # 6. Start PlutoSDR Direct DSP Receiver
-        if path == "/api/sdr/receiver/start":
-            sat = int(body_json.get("sat", 1581))
-            gain = float(body_json.get("gain", 40.0))
-            sf = int(body_json.get("sf", 7))
-            bw = int(body_json.get("bw", 500_000))
-            uri = str(body_json.get("uri", "usb:"))
-
-            with state.lock:
-                if state.sdr_active:
-                    state.sdr_stop_event.set()
-                    time.sleep(0.3)
-
-                state.sdr_stop_event.clear()
-                state.sdr_error = None
-                sdr_worker = threading.Thread(
-                    target=background_sdr_receiver_loop,
-                    args=(sat, gain, sf, bw, uri),
-                    daemon=True,
-                    name="pluto-sdr-rx",
-                )
-                state.sdr_thread = sdr_worker
-                sdr_worker.start()
-
-            time.sleep(0.6)
-            with state.lock:
-                self._send_json(HTTPStatus.OK, {
-                    "status": "active" if state.sdr_active else "starting",
-                    "sat": sat,
-                    "frequency_hz": 916_000_000 + (sat % 18) * 600_000,
-                    "gain": gain,
-                    "sf": sf,
-                    "bw": bw,
-                    "uri": uri,
-                    "error": state.sdr_error,
-                })
+        # Legacy / inform endpoints
+        if path in ("/api/connect", "/api/disconnect"):
+            self._send_json(HTTPStatus.OK, {
+                "notice": "Server COM connection disabled. Ground station uses Client Web USB/Serial directly in the browser."
+            })
             return
-
-        # 7. Stop PlutoSDR Direct DSP Receiver
-        if path == "/api/sdr/receiver/stop":
-            with state.lock:
-                state.sdr_stop_event.set()
-                state.sdr_active = False
-            self._send_json(HTTPStatus.OK, {"status": "stopped"})
-            return
-
-        # 8. PlutoSDR Transmit Commands
-        if path == "/api/sdr/transmit":
-            sat = int(body_json.get("sat", 1581))
-            cmd_type = str(body_json.get("command", "ping"))
-            params = body_json.get("params", {})
-            bw = int(body_json.get("bw", 500_000))
-            uri = str(body_json.get("uri", "usb:"))
-
-            try:
-                res = transmit_sdr_command(sat=sat, cmd_type=cmd_type, params=params, bw=bw, sdr_uri=uri)
-                self._send_json(HTTPStatus.OK, res)
-            except Exception as exc:
-                self._send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(exc)})
-            return
-
 
         self._send_json(HTTPStatus.NOT_FOUND, {"error": "Endpoint not found"})
 
@@ -2587,7 +1501,7 @@ class GroundStationAPIHandler(BaseHTTPRequestHandler):
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="RASCube Ground Station REST API Server with Swagger UI")
+    parser = argparse.ArgumentParser(description="RASCube Ground Station REST API Server (Client Web USB/Serial)")
     parser.add_argument("--host", default="0.0.0.0", help="Host interface (default: 0.0.0.0)")
     parser.add_argument("--port", type=int, default=8080, help="Port to listen on (default: 8080)")
     parser.add_argument("--ssl", action="store_true", help="Enable HTTPS (auto-generates self-signed TLS cert if none provided)")
@@ -2602,7 +1516,6 @@ def main() -> None:
     proto = "http"
     enable_ssl = args.ssl or os.environ.get("ENABLE_SSL", "0").lower() in ("1", "true", "yes")
     if enable_ssl or args.ssl_cert:
-        import ssl
         cert_file = args.ssl_cert
         key_file = args.ssl_key
 
@@ -2614,7 +1527,6 @@ def main() -> None:
             key_file = os.path.join(cert_dir, "server.key")
             if not (os.path.exists(cert_file) and os.path.exists(key_file)):
                 try:
-                    import subprocess
                     subprocess.run([
                         "openssl", "req", "-x509", "-newkey", "rsa:2048",
                         "-keyout", key_file, "-out", cert_file,
@@ -2631,19 +1543,17 @@ def main() -> None:
             proto = "https"
 
     url = f"{proto}://localhost:{args.port}"
-    print("=" * 65)
-    print(f"🚀 RASCubeV2 Ground Station API & Swagger UI Server Running ({proto.upper()})")
+    print("=" * 70)
+    print(f"🚀 RASCube Ground Station Running ({proto.upper()}) [Client Web USB/Serial Mode]")
+    print(f"💻 Live Dashboard         : {url}/")
     print(f"📖 Swagger UI Docs        : {url}/docs")
     print(f"📄 OpenAPI Specification  : {url}/openapi.json")
-    print(f"🛰️ Ground Station Dashboard: {url}/")
-    print("=" * 65)
+    print("=" * 70)
 
     try:
         server.serve_forever()
     except KeyboardInterrupt:
-        print("\nShutting down server...")
-        with state.lock:
-            state.stop_signal.set()
+        print("\nShutting down ground station server...")
         server.server_close()
 
 

@@ -21,7 +21,6 @@ from rascube_v2.decoder import (
     decode_telemetry_to_dict,
     telemetry_to_dict,
 )
-from rascube_v2.sdr import PlutoSDRReceiver, PlutoSDRTransmitter, SDRLoRaConfig
 from rascube_v2.sync import RASCube as SyncRASCube
 from rascube_v2.transport.serial import SerialDevice, find_receivers
 
@@ -42,15 +41,12 @@ __all__ = [
     "CameraAssemblyError",
     "ConnectionClosedError",
     "ConnectionLostError",
-    "PlutoSDRReceiver",
-    "PlutoSDRTransmitter",
     "ProtocolDecodeError",
     "RASCube",
     "RASCubeError",
     "ReceiverMode",
     "ReceiverStatusFlag",
     "RequestTimeoutError",
-    "SDRLoRaConfig",
     "SerialDevice",
     "SessionBusyError",
     "SyncRASCube",

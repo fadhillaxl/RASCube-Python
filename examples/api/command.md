@@ -1,67 +1,115 @@
-# 🚀 RASCube Ground Station API & Web Dashboard
+# 🚀 RASCube Ground Station (Client Web USB / Web Serial)
 
-## 1. Run Server
+Ground Station RASCube menggunakan arsitektur **Client Web USB / Web Serial**.  
+Dongle USB Receiver dihubungkan langsung ke laptop/komputer klien melalui browser (Chrome, Edge, Opera), sehingga **server backend / Docker tidak memerlukan passthrough perangkat USB atau izin privileged**.
 
-### Option A: Local Python
+---
+
+## 1. Menjalankan Server API & Web Dashboard
+
+### Opsi A: Local Python
 ```bash
 python examples/api/server.py --port 8080
 ```
-Open Dashboard at: **http://localhost:8080**  
-Open Swagger UI at: **http://localhost:8080/docs**
+- Web Dashboard: **http://localhost:8080**
+- Swagger UI Docs: **http://localhost:8080/docs**
+- OpenAPI Schema: **http://localhost:8080/openapi.json**
 
-### Option B: Docker Container (Port 7072)
+### Opsi B: Docker Container
 ```bash
-# 1. Build and Run via Docker Compose
+# Jalankan via Docker Compose
 docker compose up -d
 
-# OR run directly via Docker CLI
+# Atau jalankan langsung via Docker CLI
 docker build -t rascube-api:latest .
-docker run -d --name rascube-groundstation -p 7072:8080 --restart unless-stopped rascube-api:latest
+docker run -d --name rascube-groundstation -p 8080:8080 --restart unless-stopped rascube-api:latest
 ```
-Open Dashboard at: **http://localhost:7072**  
-Open Swagger UI at: **http://localhost:7072/docs**  
-Open OpenAPI JSON at: **http://localhost:7072/openapi.json**
-
+- Web Dashboard: **http://localhost:8080** (atau IP server Anda)
+- Swagger UI Docs: **http://localhost:8080/docs**
 
 ---
 
-## 2. PlutoSDR Hardware Direct DSP Mode (via API)
+## 2. Cara Menghubungkan Browser ke USB Dongle
 
-### Start PlutoSDR Live Demodulator (`--sat 1581 --gain 40`)
+1. Buka dashboard di browser (Google Chrome, Microsoft Edge, atau Opera).
+2. Tancapkan **RASCube USB Receiver Dongle** ke port USB laptop Anda.
+3. Masukkan **Target Satellite Serial Number** (default: `1581`).
+4. Klik tombol **"🔌 Connect Browser USB"**.
+5. Pilih perangkat USB (*STMicroelectronics Virtual COM Port / RASCube Receiver*), lalu klik **Connect**.
+6. Browser akan membaca seluruh frame satelit secara real-time, menampilkan telemetri & foto kamera seketika, serta menyinkronkan data ke backend API.
+
+---
+
+## 3. Perintah Uplink Satelit (Langsung via Web Serial)
+
+Perintah radio uplink dapat dikirim langsung dari browser ke satelit melalui Web Serial:
+
+- **💡 Blink RGB LED**: Mengirim perintah aktivasi LED satelit (Port `0x80`).
+- **🎵 Play Startup Song**: Mengirim perintah memutar nada startup buzzer satelit (Port `0x84`).
+- **📡 Ping Satellite (OBC Info)**: Mengirim request info status onboard computer (Port `0x12`).
+- **📸 Capture Satellite Photo**: Mengirim trigger kamera satelit (Port `0x13`), menerima blok gambar JPEG secara progresif (Port `0x15` / `0x20`), dan merakitnya secara real-time.
+
+---
+
+## 4. API Endpoints Reference
+
+### Status Ground Station & Koneksi Klien
 ```bash
-curl -X POST http://localhost:8080/api/sdr/receiver/start \
-  -H "Content-Type: application/json" \
-  -d '{"sat": 1581, "gain": 40.0, "sf": 7, "bw": 500000, "uri": "usb:"}'
+curl http://localhost:8080/api/status
 ```
 
-### Stop PlutoSDR Receiver
+### Telemetri Snapshot Terakhir
 ```bash
-curl -X POST http://localhost:8080/api/sdr/receiver/stop
+curl http://localhost:8080/api/telemetry/latest
 ```
 
-### PlutoSDR Radio Uplink Commands
+### Riwayat Telemetri (History Buffer)
 ```bash
-# Blink Satellite RGB LED
-curl -X POST http://localhost:8080/api/sdr/transmit \
-  -H "Content-Type: application/json" \
-  -d '{"sat": 1581, "command": "blink", "bw": 500000}'
+curl "http://localhost:8080/api/telemetry/history?limit=20"
+```
 
-# Play Startup Song
-curl -X POST http://localhost:8080/api/sdr/transmit \
-  -H "Content-Type: application/json" \
-  -d '{"sat": 1581, "command": "song", "bw": 500000}'
+### Real-time Server-Sent Events (SSE) Stream
+```bash
+curl -N http://localhost:8080/api/telemetry/stream
+```
 
-# Hardware Continuous Wake Beacon (FPGA DMA Cyclic)
-curl -X POST http://localhost:8080/api/sdr/transmit \
+### Status & Foto Kamera Satelit Terakhir
+```bash
+# Status assembly kamera & progress blok
+curl http://localhost:8080/api/camera/status
+
+# JSON gambar terakhir (Base64)
+curl http://localhost:8080/api/camera/latest
+
+# Unduh file gambar JPEG langsung
+curl http://localhost:8080/api/camera/latest.jpg -o satellite_photo.jpg
+```
+
+### Ingest Telemetri (Manual atau dari Skrip Klien)
+```bash
+curl -X POST http://localhost:8080/api/telemetry/ingest \
   -H "Content-Type: application/json" \
-  -d '{"sat": 1581, "command": "wake", "bw": 500000}'
+  -d '{"hex": "10796C3100008E13EC0C00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"}'
 ```
 
 ---
 
-## 3. Web USB / Web Serial Client Mode
-1. Open **http://localhost:8080** in Chrome or Edge.
-2. Select tab **"💻 Client Web USB/Serial"**.
-3. Plug in the RASCube USB Receiver Dongle into your computer.
-4. Click **"🔌 Connect Browser USB"** and select the RASCube Dongle.
-5. The browser will read raw frames directly and stream live telemetry to the dashboard!
+## 5. Akses Jarak Jauh (Remote IP / LAN) & Secure Context
+
+Standar keamanan Chrome dan Edge mengharuskan **Secure Context** (HTTPS atau localhost) untuk menggunakan Web Serial API.
+
+Jika Anda membuka dashboard melalui IP jaringan lokal (misal: `http://192.168.123.176:8080`):
+
+### Pilihan 1: Aktifkan Flag Chrome (Cepat & Praktis)
+1. Buka tab baru di browser: `chrome://flags/#unsafely-treat-insecure-origin-as-secure`
+2. Ubah opsi menjadi **Enabled**.
+3. Masukkan origin URL server Anda: `http://192.168.123.176:8080`
+4. Klik tombol **Relaunch** di kanan bawah.
+5. Web Serial langsung aktif dan siap digunakan!
+
+### Pilihan 2: Aktifkan Built-in HTTPS
+Jalankan server dengan flag `--ssl` atau set `ENABLE_SSL=1` di `docker-compose.yml`:
+```bash
+python examples/api/server.py --port 8443 --ssl
+```
+Sertifikat TLS self-signed akan dibuat secara otomatis.
